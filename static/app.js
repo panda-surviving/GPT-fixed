@@ -61,12 +61,50 @@ let filteredSymbols = [];
 let symbolPage = 1;
 const SYMBOLS_PER_PAGE = 50;
 
+function apiUrl(path) {
+  // Safari/iPad can throw "The string did not match the expected pattern"
+  // when fetch receives a malformed/relative URL after navigation. Build a
+  // fully-qualified same-origin URL for every API request instead.
+  const raw = String(path || "").trim();
+  try {
+    return new URL(raw, window.location.origin + "/").toString();
+  } catch (err) {
+    throw new Error(`Invalid API URL: ${raw}`);
+  }
+}
+
 async function getJSON(url, options = {}) {
-  const response = await fetch(url, options);
-  const data = await response.json();
+  const target = apiUrl(url);
+  const controller = new AbortController();
+  const timeoutMs = Number(options.timeoutMs || 30000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const fetchOptions = { ...options, signal: options.signal || controller.signal, cache: "no-store" };
+  delete fetchOptions.timeoutMs;
+
+  let response;
+  let text = "";
+  try {
+    response = await fetch(target, fetchOptions);
+    text = await response.text();
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)} seconds: ${target}`);
+    }
+    throw new Error(`API request failed: ${err?.message || String(err)}`);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch (err) {
+    const preview = text.replace(/\s+/g, " ").slice(0, 180);
+    throw new Error(`Server returned invalid JSON (${response.status}) from ${target}: ${preview}`);
+  }
 
   if (!response.ok) {
-    throw new Error(data.error || `Request failed: ${response.status}`);
+    throw new Error(data.error || data.message || `Request failed: ${response.status}`);
   }
 
   return data;
@@ -3862,7 +3900,11 @@ async function runPsxDivergenceScan() {
     if (!startData.ok) { statusEl.textContent = "Error: " + startData.error; return; }
 
     while (true) {
-      const data = await getJSON("/api/psxdivergence/scan/status/" + startData.job_id);
+      const jobId = String(startData.job_id || "").trim();
+      if (!jobId || !/^[0-9a-f-]{20,80}$/i.test(jobId)) {
+        throw new Error("Server returned an invalid scan job ID. Please reload the page and try again.");
+      }
+      const data = await getJSON("/api/psxdivergence/scan/status/" + encodeURIComponent(jobId), { timeoutMs: 30000 });
       if (!data.ok || data.status === "error") {
         statusEl.textContent = "Error: " + (data.error || "scan failed");
         return;

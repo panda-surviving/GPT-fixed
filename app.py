@@ -4864,17 +4864,28 @@ def api_psx_divergence_scan_start():
     guard = _technicals_guard()
     if guard:
         return guard
-    job_id = _new_tech_job()
-    _run_psx_divergence_job_in_background(job_id)
-    return safe_jsonify({"ok": True, "job_id": job_id})
+    try:
+        job_id = _new_tech_job()
+        _run_psx_divergence_job_in_background(job_id)
+        response = safe_jsonify({"ok": True, "job_id": job_id, "message": "Market-wide PSX scan started."})
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return response
+    except Exception as exc:
+        response = safe_jsonify({"ok": False, "error": f"Could not start PSX scan: {exc}"})
+        response.headers["Cache-Control"] = "no-store"
+        return response, 500
 
 
 @app.get("/api/psxdivergence/scan/status/<job_id>")
 def api_psx_divergence_scan_status(job_id):
     job = _get_tech_job(job_id)
     if job is None:
-        return safe_jsonify({"ok": False, "error": "Unknown job id (server may have restarted)."}), 404
-    return safe_jsonify({"ok": True, **job})
+        response = safe_jsonify({"ok": False, "error": "Unknown job id (server may have restarted)."})
+        response.headers["Cache-Control"] = "no-store"
+        return response, 404
+    response = safe_jsonify({"ok": True, **job})
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return response
 
 
 @app.get("/api/psxdivergence/scan/cached")
