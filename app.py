@@ -1369,6 +1369,8 @@ def stock_matches_filters(quote, criteria):
         return False
     if criteria.get("above_sma200") and quote.get("above_sma200") is not True:
         return False
+    if criteria.get("above_ema20") and quote.get("above_ema20") is not True:
+        return False
     if criteria.get("golden_cross") and quote.get("golden_death_cross") != "golden_cross":
         return False
     if criteria.get("death_cross") and quote.get("golden_death_cross") != "death_cross":
@@ -2014,13 +2016,20 @@ def _obv(closes, volumes):
 
 
 def compute_technicals(symbol):
-    """Real technical indicators computed from stock_price_history.
-    Returns None for any indicator that doesn't have enough recorded
-    trading days yet, plus a 'progress' dict so the UI can show exactly
-    how close each one is to activating — never a fabricated value."""
-    history = get_price_history(symbol)
-    closes = [h["close"] for h in history if h["close"] is not None]
-    volumes = [h["volume"] for h in history]
+    """Real technical indicators from the same PSX OHLCV history used by
+    the stock chart and divergence engine. This removes the old dependency
+    on Yalvon360's locally recorded history, which made the technical
+    screener appear permanently "activating" on a fresh Render instance."""
+    symbol = symbol.upper().strip()
+    try:
+        df = get_full_history_cached(symbol)
+        if df is None or df.empty:
+            return {"symbol": symbol, "data_days": 0, "price": None, "progress": {key: {"have": 0, "needed": needed, "pct": 0, "note": "No real PSX history available yet."} for key, needed in TECHNICAL_REQUIREMENTS.items()}}
+        df = df.sort_values("date").dropna(subset=["close"]).reset_index(drop=True)
+        closes = [float(x) for x in df["close"].tolist() if pd.notna(x)]
+        volumes = [float(x) if pd.notna(x) else None for x in df.get("volume", pd.Series([None] * len(df))).tolist()]
+    except Exception:
+        return {"symbol": symbol, "data_days": 0, "price": None, "progress": {key: {"have": 0, "needed": needed, "pct": 0, "note": "Unable to fetch real PSX history."} for key, needed in TECHNICAL_REQUIREMENTS.items()}}
     have = len(closes)
 
     sma20 = _sma(closes, 20)
@@ -2053,7 +2062,7 @@ def compute_technicals(symbol):
         pct = min(100, round(have / needed * 100)) if needed else 100
         return {
             "have": have, "needed": needed, "pct": pct,
-            "note": RECORDING_START_NOTE.format(needed=needed, have=have, pct=pct),
+            "note": f"Using real PSX historical OHLCV: {have} trading days available.",
         }
 
     return {
@@ -2066,6 +2075,7 @@ def compute_technicals(symbol):
         "obv": obv,
         "golden_death_cross": golden_death,
         "above_sma20": (closes[-1] > sma20) if (closes and sma20) else None,
+        "above_ema20": (closes[-1] > ema20) if (closes and ema20) else None,
         "above_sma50": (closes[-1] > sma50) if (closes and sma50) else None,
         "above_sma200": (closes[-1] > sma200) if (closes and sma200) else None,
         "rsi_overbought": (rsi14 >= 70) if rsi14 is not None else None,
@@ -2173,16 +2183,9 @@ def get_bulk_quotes(force=False):
     if force:
         refresh_bulk_quotes()
     elif stale and not has_items:
-        # Do not make the first browser request wait for hundreds of upstream
-        # requests. Serve a tiny built-in snapshot while the full universe
-        # warms in the background.
-        fallback = [
-            {"symbol": symbol, **quote, "change_pct": quote.get("change")}
-            for symbol, quote in FALLBACK_QUOTES.items()
-        ]
-        with _bulk_quote_lock:
-            _bulk_quote_cache["items"] = fallback
-            _bulk_quote_cache["time"] = datetime.now()
+        # Never expose the ten-symbol development snapshot as live PSX data.
+        # Start the real full-universe refresh in the background and return an
+        # empty live snapshot until genuine PSX quotes arrive.
         threading.Thread(target=refresh_bulk_quotes, daemon=True).start()
     elif stale:
         # Cache is stale but we already have something to show — refresh
@@ -3282,14 +3285,8 @@ def catalog_with_progress():
             item = dict(item)
             key = item.get("filter_key")
             if item["available"] and key in TECHNICAL_REQUIREMENTS:
-                needed = TECHNICAL_REQUIREMENTS[key]
-                if days < needed:
-                    pct = round(days / needed * 100) if needed else 100
-                    item["activating"] = True
-                    item["reason"] = (
-                        f"Activating: {days}/{needed} trading days recorded ({pct}%). "
-                        f"Recording started {progress['started_on'] or 'today'}."
-                    )
+                item["activating"] = False
+                item["reason"] = "Live: computed from real PSX historical OHLCV on demand."
             items.append(item)
         sections.append({**section, "items": items})
 
@@ -3304,7 +3301,7 @@ def screener_catalog():
 
 TECHNICAL_CRITERIA_KEYS = {
     "rsi_min", "rsi_max", "above_sma20", "above_sma50", "above_sma200",
-    "golden_cross", "death_cross", "macd_bullish", "rsi_oversold", "rsi_overbought",
+    "above_ema20", "golden_cross", "death_cross", "macd_bullish", "rsi_oversold", "rsi_overbought",
 }
 
 
@@ -3332,6 +3329,10 @@ def screener_run():
 
     if TECHNICAL_CRITERIA_KEYS & set(criteria.keys()):
         symbols = [q.get("symbol") for q in items if q.get("symbol")]
+        # Warm all requested PSX histories in batches before per-symbol
+        # indicator calculation. This keeps a first-run technical screen
+        # from generating hundreds of serial network calls.
+        _prefetch_psx_histories_batch(symbols, period="5y", batch_size=50, max_workers=3)
         with _technicals_cache_lock:
             missing = [s for s in symbols if s.upper() not in _technicals_cache]
 
@@ -3541,6 +3542,78 @@ def parse_psx_announcement_page(html, limit=80):
         if len(results) >= limit:
             break
     return results
+
+
+def _parse_company_announcements(html, symbol, limit=50):
+    """Extract only the announcements belonging to one PSX company page.
+    Company pages expose an Announcements tab with date/title/document rows;
+    unlike the market-wide page, no symbol guessing is needed."""
+    soup = BeautifulSoup(html, "html.parser")
+    out, seen = [], set()
+    for row in soup.find_all("tr"):
+        cells = [" ".join(c.get_text(" ", strip=True).split()) for c in row.find_all(["td", "th"])]
+        if len(cells) < 2:
+            continue
+        links = row.find_all("a", href=True)
+        pdf = next((a.get("href") for a in links if "download" in str(a.get("href")).lower() or "pdf" in str(a.get("href")).lower()), None)
+        href = pdf or (links[-1].get("href") if links else None)
+        if not href:
+            continue
+        text = " | ".join(cells)
+        low = text.lower()
+        if not any(k in low for k in ("report", "result", "meeting", "announcement", "notice", "dividend", "payout", "disclosure", "information", "transmission", "briefing", "interest", "financial")):
+            # Company pages can contain non-filing tables; only retain rows
+            # that look like dated filings or have a document link.
+            if not re.search(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b|\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", text, re.I):
+                continue
+        if href.startswith("/"):
+            href = PSX_ALT_BASE + href
+        elif href.startswith("http://"):
+            href = "https://" + href[7:]
+        if not href.startswith("http"):
+            continue
+        key=(text,href)
+        if key in seen: continue
+        seen.add(key)
+        out.append({"symbol": symbol, "title": text[:500], "url": href})
+        if len(out) >= limit: break
+    return out
+
+
+@app.get("/api/psx/announcements")
+def psx_announcements():
+    symbol = request.args.get("symbol", "").strip().upper()
+    limit = min(max(int(request.args.get("limit", 50) or 50), 1), 100)
+    result = {"ok": True, "symbol": symbol or None, "announcements": [], "source": "Pakistan Stock Exchange"}
+    try:
+        if symbol:
+            html, source_url = _fetch_psx_html([PSX_ALT_COMPANY_URL.format(symbol=symbol), PSX_COMPANY_URL.format(symbol=symbol)], timeout=10)
+            result["announcements"] = _parse_company_announcements(html, symbol, limit)
+            result["source_url"] = source_url
+        else:
+            html, source_url = _fetch_psx_html(["https://dps.csapis.com/announcements/companies", "https://dps.psx.com.pk/announcements/companies"], timeout=10)
+            soup = BeautifulSoup(html, "html.parser")
+            rows=[]; seen=set()
+            for row in soup.find_all("tr"):
+                cells=[" ".join(c.get_text(" ", strip=True).split()) for c in row.find_all(["td","th"])]
+                if len(cells) < 4: continue
+                links=row.find_all("a", href=True)
+                href=next((a.get("href") for a in links if "download" in str(a.get("href")).lower() or "pdf" in str(a.get("href")).lower()), None)
+                if not href: continue
+                symbol_cell=next((c for c in cells if re.fullmatch(r"[A-Z0-9&.\-]{1,30}", c.strip())), "")
+                if not symbol_cell: continue
+                title=cells[-1] if cells[-1] else "PSX announcement"
+                if href.startswith("/"): href=PSX_ALT_BASE+href
+                elif href.startswith("http://"): href="https://"+href[7:]
+                key=(symbol_cell,title,href)
+                if key in seen: continue
+                seen.add(key); rows.append({"symbol":symbol_cell,"title":" | ".join(cells),"url":href})
+                if len(rows)>=limit: break
+            result["announcements"]=rows; result["source_url"]=source_url
+        result["available"] = bool(result["announcements"])
+    except Exception as exc:
+        result["ok"] = False; result["error"] = str(exc)
+    return safe_jsonify(result)
 
 
 @app.get("/api/psx/financials")
@@ -4693,6 +4766,114 @@ PSX_DIVERGENCE_HISTORY_CACHE_HOURS = 24
 _psx_divergence_history_cache = {}
 _psx_divergence_history_cache_lock = threading.Lock()
 
+def _normalize_yahoo_batch_frame(frame, ticker):
+    """Normalize one ticker from yfinance's batch download output."""
+    if frame is None or frame.empty:
+        return None
+    try:
+        df = frame.copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            # group_by="ticker" normally gives (TICKER, FIELD). Locate the
+            # requested ticker regardless of Yahoo's capitalization.
+            labels = [str(x) for x in df.columns.get_level_values(0)]
+            wanted = ticker.upper()
+            match = next((x for x in sorted(set(labels), key=len, reverse=True)
+                          if x.upper() == wanted), None)
+            if match is not None:
+                df = df.xs(match, axis=1, level=0, drop_level=True)
+            else:
+                # Some yfinance versions return (FIELD, TICKER).
+                labels2 = [str(x) for x in df.columns.get_level_values(1)]
+                match2 = next((x for x in sorted(set(labels2), key=len, reverse=True)
+                               if x.upper() == wanted), None)
+                if match2 is not None:
+                    df = df.xs(match2, axis=1, level=1, drop_level=True)
+        rename = {str(c).lower(): str(c).lower() for c in df.columns}
+        df = df.rename(columns=rename)
+        needed = {"open", "high", "low", "close", "volume"}
+        if not needed.issubset(set(df.columns)):
+            return None
+        df = df.reset_index()
+        date_col = "date" if "date" in df.columns else df.columns[0]
+        df = df.rename(columns={date_col: "date"})
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True).dt.tz_localize(None)
+        for c in ("open", "high", "low", "close", "volume"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+        return _sanitize_ohlcv(df)
+    except Exception:
+        return None
+
+
+def _prefetch_psx_histories_batch(symbols, period="5y", batch_size=50, max_workers=3):
+    """Warm the in-process PSX history cache with batched Yahoo .KA downloads.
+
+    A market-wide divergence/technical scan should not issue one HTTP request
+    per symbol. Yahoo's batch endpoint lets us retrieve many PSX-listed tickers
+    in a small number of requests, after which all indicator calculations are
+    local pandas/numpy work. Direct PSX/single-symbol providers remain the
+    fallback for symbols Yahoo cannot supply.
+    """
+    try:
+        import yfinance as yf
+    except Exception:
+        return 0
+    clean = []
+    seen = set()
+    for symbol in symbols:
+        sym = str(symbol).upper().strip()
+        if not sym or sym in seen or not re.match(r"^[A-Z0-9&.\-]{1,30}$", sym):
+            continue
+        seen.add(sym); clean.append(sym)
+    if not clean:
+        return 0
+
+    now = datetime.now()
+    missing = []
+    with _psx_divergence_history_cache_lock:
+        for sym in clean:
+            entry = _psx_divergence_history_cache.get(sym)
+            if entry and now - entry["time"] < timedelta(hours=PSX_DIVERGENCE_HISTORY_CACHE_HOURS) and entry.get("df") is not None and len(entry["df"]) >= 20:
+                continue
+            missing.append(sym)
+    if not missing:
+        return len(clean)
+
+    batches = [missing[i:i+batch_size] for i in range(0, len(missing), batch_size)]
+    def one_batch(batch):
+        tickers = [f"{s}.KA" for s in batch]
+        try:
+            frame = yf.download(
+                tickers=tickers,
+                period=period,
+                interval="1d",
+                group_by="ticker",
+                auto_adjust=False,
+                progress=False,
+                threads=True,
+            )
+        except Exception:
+            return 0
+        stored = 0
+        for sym in batch:
+            df = _normalize_yahoo_batch_frame(frame, f"{sym}.KA")
+            if df is not None and len(df) >= 20:
+                with _psx_divergence_history_cache_lock:
+                    _psx_divergence_history_cache[sym] = {"df": df, "time": datetime.now()}
+                # Share the same warmed history with the stock-detail cache.
+                with _stock_history_cache_lock:
+                    _stock_history_cache[sym] = {"df": df, "time": datetime.now()}
+                stored += 1
+        return stored
+
+    stored = 0
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as pool:
+        for n in pool.map(one_batch, batches):
+            stored += n
+    return stored
+
+
 def get_divergence_history_cached(symbol):
     symbol = symbol.upper()
     now = datetime.now()
@@ -4768,6 +4949,17 @@ def run_psx_divergence_scan(progress_cb=None):
     if not tickers:
         raise RuntimeError("PSX did not return a symbol list.")
 
+    # Warm as much of the full universe as possible in a handful of batched
+    # requests before falling back to per-symbol providers. This is the main
+    # performance fix for the 555+ symbol market-wide scan.
+    prefetch_started = time.time()
+    if progress_cb:
+        progress_cb(0, total, "Preparing batched PSX history…")
+    prefetched = _prefetch_psx_histories_batch(tickers, period="5y", batch_size=50, max_workers=3)
+    prefetch_seconds = round(time.time() - prefetch_started, 2)
+    if progress_cb:
+        progress_cb(0, total, f"History cache warmed for {prefetched}/{total} symbols")
+
     start_date = date.today() - timedelta(days=PSX_DIVERGENCE_HISTORY_DAYS)
 
     near_low_hits, divergence_hits = [], []
@@ -4842,6 +5034,8 @@ def run_psx_divergence_scan(progress_cb=None):
         "universe_count": total,
         "symbols_with_data": total - len(errors),
         "symbols_failed": len(errors),
+        "history_prefetched": prefetched,
+        "history_prefetch_seconds": prefetch_seconds,
         "scan_complete": True,
     }
 
@@ -4865,9 +5059,18 @@ def api_psx_divergence_scan_start():
     if guard:
         return guard
     try:
+        # Show the most recent full-market result immediately when one exists,
+        # while a fresh scan runs in the background. This prevents the UI from
+        # appearing frozen for several minutes on a Render free-tier wake-up.
+        cached = _load_tech_cache("psxdivergence")
         job_id = _new_tech_job()
         _run_psx_divergence_job_in_background(job_id)
-        response = safe_jsonify({"ok": True, "job_id": job_id, "message": "Market-wide PSX scan started."})
+        payload = {"ok": True, "job_id": job_id, "message": "Market-wide PSX scan started."}
+        if cached and cached.get("data"):
+            payload["cached_result"] = cached["data"]
+            payload["cached_saved_at"] = cached.get("saved_at")
+            payload["message"] = "Showing the last full-market scan immediately while a fresh scan runs in the background."
+        response = safe_jsonify(payload)
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return response
     except Exception as exc:

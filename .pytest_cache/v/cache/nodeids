@@ -1,0 +1,8 @@
+[
+  "tests/test_regression_static.py::test_chart_monthly_resample_is_pandas_compatible",
+  "tests/test_regression_static.py::test_full_scan_never_uses_ten_symbol_fallback",
+  "tests/test_regression_static.py::test_indicator_values_and_pivots_are_rendered",
+  "tests/test_regression_static.py::test_psx_historical_request_has_required_parameters",
+  "tests/test_regression_static.py::test_real_history_fallbacks_exist",
+  "tests/test_regression_static.py::test_service_worker_cache_is_bumped"
+]

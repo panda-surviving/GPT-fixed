@@ -121,7 +121,8 @@ const pageMeta = {
   stockdetail: ["Stock Profile", "Detailed stock data inside Yalvon360"],
   sectors: ["Sector Rotation", "Sector performance overview"],
   macro: ["Pakistan Macro", "Key economic indicators"],
-  news: ["Announcements", "Company and exchange updates"],
+  news: ["News", "Company and market updates"],
+  announcements: ["Announcements", "All PSX company announcements and notices"],
   journal: ["Journal", "Analysis, education and podcasts"],
   tools: ["Tools", "Calculators built around your money"],
   worldclock: ["World Clock", "Global trading sessions at a glance"],
@@ -237,7 +238,8 @@ async function go(page) {
   if (page === "psxdivergence") await loadPsxDivergenceCached();
   if (page === "forextech") await loadForexTechCached();
   if (page === "cryptotech") await loadCryptoTechCached();
-  if (["dashboard", "sentiment", "sectors", "macro", "news"].includes(page)) await loadExtras();
+  if (["dashboard", "sentiment", "sectors", "macro", "news", "announcements"].includes(page)) await loadExtras();
+  if (page === "announcements") await loadAllPsxAnnouncements();
   if (page === "macro") await loadMacroPage();
 }
 
@@ -1290,12 +1292,10 @@ async function loadStockFinancials(symbol) {
   if (!el) return;
   el.innerHTML = `<div class="loading-panel">Loading official PSX filings…</div>`;
   try {
-    const d = await getJSON(`/api/psx/financials?symbol=${encodeURIComponent(symbol)}&limit=40`);
+    const d = await getJSON(`/api/psx/announcements?symbol=${encodeURIComponent(symbol)}&limit=40`);
     const links = d.announcements || [];
-    const cards = links.map(x => `<a class="announcement-card clickable-row" href="${esc(x.url)}" target="_blank" rel="noopener"><div class="announcement-symbol">PSX</div><div><strong>${esc(x.title)}</strong><small>Official PSX filing / announcement</small></div></a>`).join("");
-    const fallbackLinks = d.official_links ? `
-      <div class="muted-note" style="margin-top:12px">Official repositories: <a href="${esc(d.official_links.financial_reports)}" target="_blank" rel="noopener">Financial Reports</a> · <a href="${esc(d.official_links.analysis_reports)}" target="_blank" rel="noopener">Analysis Reports</a> · <a href="${esc(d.official_links.company_announcements)}" target="_blank" rel="noopener">Company Announcements</a></div>` : "";
-    el.innerHTML = (cards || `<div class="empty-chart">No filings were returned right now.</div>`) + fallbackLinks;
+    const cards = links.map(x => `<a class="announcement-card clickable-row" href="${esc(x.url)}" target="_blank" rel="noopener"><div class="announcement-symbol">${esc(symbol)}</div><div><strong>${esc(x.title)}</strong><small>Official PSX filing for ${esc(symbol)}</small></div></a>`).join("");
+    el.innerHTML = cards || `<div class="empty-chart">No company-specific PSX announcements were returned for ${esc(symbol)} right now.</div>`;
   } catch (e) {
     el.innerHTML = `<div class="error-panel">Could not load PSX filings: ${esc(e.message)}</div>`;
   }
@@ -1614,6 +1614,23 @@ async function loadExtras() {
         <div class="announcement-card"><div class="announcement-symbol">${esc(item.symbol)}</div><div><strong>${esc(item.title)}</strong><small>${esc(item.time)}</small></div></div>
       `).join("");
     }
+  }
+}
+
+async function loadAllPsxAnnouncements() {
+  const el = $("announcementListAll");
+  if (!el) return;
+  el.innerHTML = `<div class="loading-panel">Loading all PSX company announcements…</div>`;
+  try {
+    const d = await getJSON("/api/psx/announcements?limit=100");
+    const rows = d.announcements || [];
+    el.innerHTML = rows.length ? rows.map(item => `
+      <a class="announcement-card clickable-row" href="${esc(item.url)}" target="_blank" rel="noopener">
+        <div class="announcement-symbol">${esc(item.symbol || "PSX")}</div>
+        <div><strong>${esc(item.title)}</strong><small>Official PSX company announcement</small></div>
+      </a>`).join("") : `<div class="empty-chart">No announcements were returned right now.</div>`;
+  } catch (e) {
+    el.innerHTML = `<div class="error-panel">Could not load PSX announcements: ${esc(e.message)}</div>`;
   }
 }
 
@@ -3355,7 +3372,7 @@ async function loadDashboardTickers() {
       .map(f => ({ symbol: f.name.slice(0, 22), price: Number(f.nav).toFixed(2), pct: Number(f.ytd || 0) }));
 
     $("globalTickerBar").innerHTML = [
-      psxItems.length ? buildTickerStrip("PSX LIVE", psxItems) : "",
+      psxItems.length ? buildTickerStrip("PSX LIVE", psxItems) : `<div class="ticker-strip"><span class="ticker-strip-label">PSX LIVE</span><span class="ticker-item">Warming live PSX quotes…</span></div>`,
       cryptoItems.length ? buildTickerStrip("CRYPTO LIVE", cryptoItems) : "",
       forexItems.length ? buildTickerStrip("FOREX LIVE", forexItems) : "",
       fundItems.length ? buildTickerStrip("MUTUAL FUNDS", fundItems) : "",
@@ -3417,6 +3434,7 @@ const SCREENER_PRESETS = [
   { label: "📉 Bearish Trend (Death Cross)", criteria: { death_cross: true } },
   { label: "🚀 MACD Bullish", criteria: { macd_bullish: true } },
   { label: "💹 Above 200-day Average", criteria: { above_sma200: true } },
+  { label: "📐 Above EMA20", criteria: { above_ema20: true } },
   { label: "🔥 High Volume", criteria: { volume_min: 5000000 } },
   { label: "💰 Value (P/E under 10)", criteria: { pe_max: 10 } },
   { label: "⬆️ Big Gainers Today (≥5%)", criteria: { change_pct_min: 5 } },
@@ -3506,7 +3524,7 @@ async function loadScreenerCatalog() {
 }
 
 const CHECKLIST_FILTER_KEY_MAP = {
-  ema20: { above_sma20: true },
+  ema20: { above_ema20: true },
   sma50: { above_sma50: true },
   sma200: { above_sma200: true },
   golden_cross: { golden_cross: true },
@@ -3899,11 +3917,20 @@ async function runPsxDivergenceScan() {
     const startData = await getJSON("/api/psxdivergence/scan/start");
     if (!startData.ok) { statusEl.textContent = "Error: " + startData.error; return; }
 
+    if (startData.cached_result) {
+      renderPsxDivergenceResult(startData.cached_result, resultsEl);
+      const cachedTotal = Number(startData.cached_result.symbols_scanned || 0);
+      statusEl.textContent = cachedTotal
+        ? `Showing last full PSX scan (${cachedTotal.toLocaleString()} symbols) while a fresh scan runs in the background…`
+        : "Showing last scan while a fresh scan runs in the background…";
+    }
+
+    const jobId = String(startData.job_id || "").trim();
+    if (!jobId || !/^[0-9a-f-]{20,80}$/i.test(jobId)) {
+      throw new Error("Server returned an invalid scan job ID. Please reload the page and try again.");
+    }
+
     while (true) {
-      const jobId = String(startData.job_id || "").trim();
-      if (!jobId || !/^[0-9a-f-]{20,80}$/i.test(jobId)) {
-        throw new Error("Server returned an invalid scan job ID. Please reload the page and try again.");
-      }
       const data = await getJSON("/api/psxdivergence/scan/status/" + encodeURIComponent(jobId), { timeoutMs: 30000 });
       if (!data.ok || data.status === "error") {
         statusEl.textContent = "Error: " + (data.error || "scan failed");
@@ -3956,7 +3983,7 @@ $("psxDivergenceRunBtn")?.addEventListener("click", runPsxDivergenceScan);
 // Re-running it periodically means the PSX line appears as soon as
 // quotes are ready, instead of never appearing until a manual refresh.
 // =====================================================================
-setInterval(() => { loadDashboardTickers(); }, 60000);
+setInterval(() => { loadDashboardTickers(); }, 30000);
 
 // =====================================================================
 // Interactive Stock Chart — candlesticks, volume, SMA/EMA overlays,

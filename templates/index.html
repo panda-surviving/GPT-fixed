@@ -52,6 +52,7 @@
         <span class="nav-group-label">Research</span>
         <button class="nav" data-page="macro">Macro</button>
         <button class="nav" data-page="news">News</button>
+        <button class="nav" data-page="announcements">Announcements</button>
         <button class="nav" data-page="journal">Journal</button>
         <button class="nav" data-page="tools">Tools</button>
         <button class="nav" data-page="worldclock">World Clock</button>
@@ -1825,6 +1826,37 @@
       <p>Click any card for its historical note and trend.</p>
     </div>
     <div id="macroFullGrid" class="macro-full-grid"></div>
+  </section>
+
+
+  <section id="announcements" class="page">
+    <div class="page-intro">
+      <div>
+        <h2>PSX Announcements</h2>
+        <p>All company announcements and exchange notices. A stock's own page shows only that company's filings.</p>
+      </div>
+      <a class="primary" href="https://dps.csapis.com/announcements/companies" target="_blank" rel="noopener">Open Official PSX Announcements</a>
+    </div>
+    <div class="card">
+      <div class="card-head"><div><h3>All PSX Company Announcements</h3><p>Market-wide company announcement feed.</p></div></div>
+      <div id="announcementListAll"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><div><h3>Official Announcement Categories</h3><p>Direct PSX portals for every major notice stream.</p></div></div>
+      <div class="cards three">
+        <a class="card clickable-row" href="https://dps.csapis.com/announcements/companies" target="_blank" rel="noopener"><strong>Company Announcements</strong><span>Listed-company filings and disclosures.</span></a>
+        <a class="card clickable-row" href="https://dps.psx.com.pk/announcements?type=psx" target="_blank" rel="noopener"><strong>PSX Notices</strong><span>Exchange notices and market-wide updates.</span></a>
+        <a class="card clickable-row" href="https://dps.psx.com.pk/announcements?type=cdc" target="_blank" rel="noopener"><strong>CDC / SECP / NCCPL</strong><span>Regulatory and settlement notices.</span></a>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><div><h3>PSX Reports &amp; Downloads</h3><p>Official repositories for reports and exchange data.</p></div></div>
+      <div class="cards three">
+        <a class="card clickable-row" href="https://financials.psx.com.pk/" target="_blank" rel="noopener"><strong>Financial Reports</strong><span>Annual, half-yearly and quarterly reports.</span></a>
+        <a class="card clickable-row" href="https://dps.csapis.com/analysis-reports" target="_blank" rel="noopener"><strong>Analysis Reports</strong><span>Official PSX analysis-report archive.</span></a>
+        <a class="card clickable-row" href="https://dps.csapis.com/downloads" target="_blank" rel="noopener"><strong>Daily Downloads</strong><span>Daily and historical market downloads.</span></a>
+      </div>
+    </div>
   </section>
 
 
