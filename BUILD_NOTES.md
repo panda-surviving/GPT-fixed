@@ -60,3 +60,13 @@ This build changes the historical provider chain to:
 The full divergence scan no longer uses the 10-symbol development fallback. It obtains the real universe from PSX or the dedicated PSX scraper API and fails explicitly if neither complete universe is available.
 
 The chart now reports its data source, uses real OHLCV, and the stock-detail technical verdict visibly renders the current RSI/MACD/SMA/EMA values as well as the classic and Fibonacci pivot tables. The monthly resampling rule was changed from `ME` to `M` for pandas compatibility.
+
+
+## v4 — August 15, 2026
+- Reworked PSX universe acquisition so the official Eligible Scrips regular-equity directory is authoritative; 10-symbol development data is never exposed as the real directory/screener universe.
+- Added explicit 503 behavior when a complete universe is unavailable rather than silently misleading the user.
+- Added the personalized PSX screener columns and filters: 52W-low ≤3%, 1D/1W/1M divergence, bullish pivot RSI ≤30/≤50, bearish pivot RSI ≥70/≥90, recursive Heikin-Ashi confirmation, and structure.
+- Added real historical fallback for the small Price Graph when intraday PSX data is absent.
+- Sanitized malformed OHLC extrema to prevent the abnormal vertical candle wicks shown in the production screenshot.
+- Made stock-detail JSON resilient to intraday provider exceptions.
+- Bumped service-worker and static JS cache versions to v4.

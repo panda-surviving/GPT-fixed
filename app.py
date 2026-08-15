@@ -1546,152 +1546,147 @@ def init_db():
 # PSX symbol directory
 # ---------------------------------------------------------
 
+def _parse_eligible_scrips_html(html):
+    """Parse only the Regular Deliverable Equity Market from PSX's official
+    Eligible Scrips page.  Never mix futures/bonds/rights-contract tables into
+    the equity universe used by the stock directory or technical screener."""
+    soup = BeautifulSoup(html, "html.parser")
+    tables = soup.find_all("table")
+    candidates = []
+    for table in tables:
+        rows = table.find_all("tr")
+        parsed = []
+        for row in rows:
+            cells = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"])]
+            if len(cells) < 2:
+                continue
+            symbol, company = cells[0].strip().upper(), cells[1].strip()
+            if symbol in {"SYMBOL", "NAME"}:
+                continue
+            if not re.match(r"^[A-Z0-9&.\-]{1,30}$", symbol):
+                continue
+            # Exclude contract-style symbols and non-equity instruments.
+            if any(x in symbol for x in ("-JUL", "-AUG", "-SEP", "TFC", "SC", "-C")):
+                continue
+            parsed.append({"symbol": symbol, "company": company, "sector": ""})
+        if len(parsed) >= 100:
+            candidates = parsed
+            break
+    if not candidates:
+        raise RuntimeError("PSX Eligible Scrips page did not expose a complete regular-equity table")
+    seen=set(); out=[]
+    for row in candidates:
+        if row["symbol"] not in seen:
+            seen.add(row["symbol"]); out.append(row)
+    out.sort(key=lambda x:x["symbol"])
+    return out
+
+
 def fetch_psx_symbols(force=False):
     now = datetime.now()
-
     with _symbol_lock:
-        if (
-            not force
-            and _symbol_cache["items"]
-            and _symbol_cache["time"]
-            and now - _symbol_cache["time"] < timedelta(minutes=SYMBOL_CACHE_MINUTES)
-        ):
+        if (not force and _symbol_cache["items"] and _symbol_cache["time"]
+                and now - _symbol_cache["time"] < timedelta(minutes=SYMBOL_CACHE_MINUTES)):
             return _symbol_cache["items"]
 
-    last_exc = None
-    # First try the lightweight JSON directory, then the alternate PSX
-    # hostname, then the public Eligible Scrips HTML table. The latter is
-    # important because it contains the complete regular equity directory,
-    # not a ten-symbol development fallback.
+    errors=[]
+    # IMPORTANT: the official Eligible Scrips page is authoritative for the
+    # complete regular equity universe.  The /symbols endpoint can be a small
+    # development/quote directory on some PSX deployments, so it is never
+    # accepted as the complete universe unless it contains a large directory.
+    try:
+        r=_http_session.get(PSX_ALT_ELIGIBLE_URL, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        items=_parse_eligible_scrips_html(r.text)
+        if len(items) >= 100:
+            with _symbol_lock:
+                _symbol_cache.update({"items":items,"time":now})
+            return items
+    except Exception as exc:
+        errors.append(f"eligible: {exc}")
+
+    # Official primary PSX hostname as a second attempt.
+    try:
+        r=_http_session.get("https://dps.psx.com.pk/eligible-scrips", headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        items=_parse_eligible_scrips_html(r.text)
+        if len(items) >= 100:
+            with _symbol_lock:
+                _symbol_cache.update({"items":items,"time":now})
+            return items
+    except Exception as exc:
+        errors.append(f"primary eligible: {exc}")
+
+    # JSON symbol directories are accepted only when they are demonstrably
+    # complete (100+ entries), otherwise they are treated as a partial feed.
     for url in (PSX_SYMBOLS_URL, PSX_ALT_SYMBOLS_URL):
         try:
-            response = _http_session.get(url, headers=HEADERS, timeout=12)
-            response.raise_for_status()
-            raw = response.json()
-            items, seen = [], set()
-            for row in raw:
+            r=_http_session.get(url, headers=HEADERS, timeout=15)
+            r.raise_for_status(); raw=r.json()
+            items=[]; seen=set()
+            for row in raw if isinstance(raw,list) else []:
                 if row.get("isDebt") or row.get("isETF"):
                     continue
-                symbol = str(row.get("symbol", "")).strip().upper()
-                company = str(row.get("name", "")).strip()
-                sector = str(row.get("sectorName", "")).strip()
-                if not symbol or symbol in seen:
+                symbol=str(row.get("symbol","")).strip().upper()
+                if not symbol or symbol in seen or not re.match(r"^[A-Z0-9&.\-]{1,30}$", symbol):
                     continue
                 seen.add(symbol)
-                items.append({"symbol": symbol, "company": company, "sector": sector})
-            if items:
-                items.sort(key=lambda x: x["symbol"])
+                items.append({"symbol":symbol,"company":str(row.get("name","")).strip(),"sector":str(row.get("sectorName","")).strip()})
+            if len(items) >= 100:
+                items.sort(key=lambda x:x["symbol"])
                 with _symbol_lock:
-                    _symbol_cache["items"] = items
-                    _symbol_cache["time"] = now
+                    _symbol_cache.update({"items":items,"time":now})
                 return items
-        except (requests.RequestException, ValueError) as exc:
-            last_exc = exc
+            errors.append(f"{url}: only {len(items)} symbols")
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
 
-    try:
-        response = _http_session.get(PSX_ALT_ELIGIBLE_URL, headers=HEADERS, timeout=15)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        items, seen = [], set()
-        # Prefer the Regular Deliverable Equity Market table. If markup is
-        # changed, accepting the first symbol/name table still gives a useful
-        # complete directory rather than silently falling back to ten names.
-        for table in soup.find_all("table"):
-            rows = table.find_all("tr")
-            if not rows:
-                continue
-            for row in rows:
-                cells = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"])]
-                if len(cells) < 2:
-                    continue
-                symbol, company = cells[0].strip().upper(), cells[1].strip()
-                if symbol in {"SYMBOL", "NAME"} or not symbol or not re.match(r"^[A-Z0-9&.-]{1,30}$", symbol):
-                    continue
-                if symbol in seen:
-                    continue
-                seen.add(symbol)
-                items.append({"symbol": symbol, "company": company, "sector": ""})
-        if items:
-            items.sort(key=lambda x: x["symbol"])
-            with _symbol_lock:
-                _symbol_cache["items"] = items
-                _symbol_cache["time"] = now
-            return items
-    except requests.RequestException as exc:
-        last_exc = exc
+    raise RuntimeError("Complete PSX equity universe unavailable; refusing to return the 10-symbol development fallback. " + " | ".join(errors[-3:]))
 
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("PSX symbol directory returned no symbols")
 
 def _fallback_symbol_directory():
-    return [
-        {"symbol": s, "company": q.get("company", s), "sector": q.get("sector", "")}
-        for s, q in FALLBACK_QUOTES.items()
-    ]
+    # Kept only for legacy pages that explicitly request a development
+    # snapshot. It MUST NOT be used by All PSX Stocks or the PSX screener.
+    return [{"symbol": s, "company": q.get("company", s), "sector": q.get("sector", "")} for s, q in FALLBACK_QUOTES.items()]
 
 
 def get_symbols_nonblocking(force=False):
-    """Like fetch_psx_symbols, but never blocks the calling HTTP request
-    on a live PSX fetch. Serves whatever is already cached immediately
-    (even if stale) and refreshes in the background; on a true cold
-    start with nothing cached yet, serves the small built-in fallback
-    directory instantly and kicks a background fetch of the real one —
-    the same "instant fallback, warm in background" pattern already
-    used for bulk live quotes, so the very first visitor after a deploy
-    or free-tier wake-up never gets stuck waiting on PSX's servers.
-
-    Returns (items, warmed_up) where warmed_up is False only when the
-    fallback directory is what's being served.
-    """
-    now = datetime.now()
+    """Return a complete PSX equity directory, or a previously cached complete
+    directory.  A 10-symbol development snapshot is never presented as the
+    real PSX directory."""
+    now=datetime.now()
     with _symbol_lock:
-        has_items = bool(_symbol_cache["items"])
-        stale = (
-            _symbol_cache["time"] is None
-            or now - _symbol_cache["time"] > timedelta(minutes=SYMBOL_CACHE_MINUTES)
-        )
-        cached_items = list(_symbol_cache["items"])
-
-    if has_items and not (stale or force):
-        return cached_items, True
-
-    if has_items:
-        # Stale (or a forced refresh was requested) but we already have
-        # something to show — serve it now, refresh in the background.
-        threading.Thread(target=_background_refresh_symbols, daemon=True).start()
-        return cached_items, True
-
-    # True cold start: nothing cached at all yet. Never block on PSX here.
-    threading.Thread(target=_background_refresh_symbols, daemon=True).start()
-    return _fallback_symbol_directory(), False
+        cached=list(_symbol_cache["items"])
+        cache_time=_symbol_cache["time"]
+    if cached and cache_time and now-cache_time < timedelta(minutes=SYMBOL_CACHE_MINUTES) and not force:
+        return cached, True
+    try:
+        items=fetch_psx_symbols(force=True)
+        return items, True
+    except Exception:
+        if cached:
+            threading.Thread(target=_background_refresh_symbols, daemon=True).start()
+            return cached, True
+        return [], False
 
 
 def _background_refresh_symbols():
     try:
         fetch_psx_symbols(force=True)
-    except requests.RequestException:
-        pass  # will simply retry next time get_symbols_nonblocking is called
+    except Exception:
+        pass
 
 
 def symbol_metadata(symbol):
     symbol = symbol.upper()
-
     try:
         for row in fetch_psx_symbols():
             if row["symbol"] == symbol:
                 return row
-    except requests.RequestException:
+    except Exception:
         pass
-
     fallback = FALLBACK_QUOTES.get(symbol, {})
-
-    return {
-        "symbol": symbol,
-        "company": fallback.get("company", symbol),
-        "sector": fallback.get("sector", ""),
-    }
-
+    return {"symbol":symbol,"company":fallback.get("company",symbol),"sector":fallback.get("sector","")}
 
 # ---------------------------------------------------------
 # PSX company-page quote parser
@@ -1850,12 +1845,12 @@ def get_quote(symbol, force=False):
             with _quote_lock:
                 _quote_cache[symbol] = {"time": now, "quote": quote}
             return quote
-        except requests.RequestException as exc:
+        except Exception as exc:
             last_exc = exc
 
     try:
         raise last_exc or requests.RequestException("PSX company page unavailable")
-    except requests.RequestException as exc:
+    except Exception as exc:
         fallback = FALLBACK_QUOTES.get(symbol)
         if fallback:
             return {
@@ -2140,8 +2135,11 @@ def refresh_bulk_quotes():
     try:
         try:
             symbols = [row["symbol"] for row in fetch_psx_symbols()]
-        except requests.RequestException:
-            symbols = list(FALLBACK_QUOTES.keys())
+        except Exception:
+            with _bulk_quote_lock:
+                symbols = [q.get("symbol") for q in _bulk_quote_cache["items"] if q.get("symbol")]
+            if not symbols:
+                symbols = []
 
         results = []
 
@@ -3069,14 +3067,12 @@ def index():
 @app.get("/api/symbols")
 def symbols():
     items, warmed_up = get_symbols_nonblocking()
-    return jsonify({
-        "count": len(items),
-        "symbols": items,
-        "warming_up": not warmed_up,
-        "updated_at": (
-            _symbol_cache["time"].isoformat(timespec="seconds")
-            if _symbol_cache["time"] else None
-        )
+    if not items:
+        return safe_jsonify({"count":0,"symbols":[],"warming_up":True,"updated_at":None,
+                              "error":"Complete PSX equity directory is temporarily unavailable; the 10-symbol development snapshot is intentionally not shown."}), 503
+    return safe_jsonify({
+        "count": len(items), "symbols": items, "warming_up": not warmed_up,
+        "updated_at": _symbol_cache["time"].isoformat(timespec="seconds") if _symbol_cache["time"] else None
     })
 
 
@@ -3088,9 +3084,18 @@ def refresh_symbols():
 
 @app.get("/api/stock/<symbol>")
 def stock_detail(symbol):
-    quote = get_quote(symbol)
-    quote["series"] = get_intraday(symbol)
-    return jsonify(quote)
+    try:
+        quote = get_quote(symbol)
+    except Exception as exc:
+        quote = {"symbol":symbol.upper(), "price":None, "source":"Unavailable", "error":str(exc)}
+    try:
+        quote["series"] = get_intraday(symbol)
+    except Exception:
+        quote["series"] = []
+    # The intraday endpoint is optional. The interactive historical chart is
+    # the reliable graph and is loaded by the frontend even when intraday is
+    # unavailable, so one PSX API failure can never blank the whole stock page.
+    return safe_jsonify(quote)
 
 
 @app.get("/api/market")
@@ -4400,6 +4405,37 @@ def fetch_psx_scraper_history(symbol):
     return df
 
 
+def _sanitize_ohlcv(df):
+    """Reject/fix malformed OHLC rows that can create huge vertical candle
+    wicks (e.g. a zero LOW/HIGH from a broken upstream feed). A valid candle
+    must contain positive prices and satisfy low <= open/close <= high. When
+    an upstream provider supplies an invalid high/low but valid open/close,
+    clamp the extrema to the actual candle body rather than drawing a wick to
+    zero or another impossible level."""
+    if df is None or df.empty:
+        return df
+    df=df.copy()
+    for c in ("open","high","low","close","volume"):
+        if c not in df.columns: df[c]=None
+        df[c]=pd.to_numeric(df[c],errors="coerce")
+    for i,row in df.iterrows():
+        c=row["close"]
+        o=row["open"] if pd.notna(row["open"]) else c
+        h=row["high"] if pd.notna(row["high"]) else max(o,c)
+        l=row["low"] if pd.notna(row["low"]) else min(o,c)
+        if any(pd.isna(x) for x in (o,c)) or c<=0 or o<=0:
+            df.at[i,"open"]=None; df.at[i,"high"]=None; df.at[i,"low"]=None; continue
+        body_hi=max(o,c); body_lo=min(o,c)
+        if h<=0 or h<body_hi or h>body_hi*5:
+            h=body_hi
+        if l<=0 or l>body_lo or l<body_lo/5:
+            l=body_lo
+        if h<l: h,l=body_hi,body_lo
+        df.at[i,"open"]=o; df.at[i,"high"]=h; df.at[i,"low"]=l; df.at[i,"close"]=c
+    df=df.dropna(subset=["open","high","low","close"])
+    return df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+
+
 def fetch_yahoo_psx_history(symbol, period="max"):
     symbol = symbol.upper().strip()
     if not re.match(r"^[A-Z0-9&.\-]{1,30}$", symbol):
@@ -4428,8 +4464,9 @@ def fetch_yahoo_psx_history(symbol, period="max"):
     for c in ("open", "high", "low", "close", "volume"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    df=_sanitize_ohlcv(df)
     if len(df) < 5:
-        raise RuntimeError("Yahoo returned too few OHLCV candles")
+        raise RuntimeError("Yahoo returned too few valid OHLCV candles")
     return df
 
 
@@ -4470,7 +4507,8 @@ def _parse_history_html(html):
     if mask.any(): parsed.loc[mask]=pd.to_datetime(raw[mask], errors="coerce", dayfirst=True)
     df["date"]=parsed
     for c in ("open","high","low","close","volume"): df[c]=pd.to_numeric(df[c], errors="coerce")
-    return df.dropna(subset=["date","close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    df=df.dropna(subset=["date","close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    return _sanitize_ohlcv(df)
 
 
 def fetch_psx_history_direct(symbol, max_retries=2, retry_delays=(1, 2)):
@@ -4545,6 +4583,25 @@ def compute_multi_timeframe_divergence(full_df, daily_df):
     return out
 
 
+def _latest_heikin_ashi(df):
+    """Return the latest true Heikin-Ashi OHLC values using the standard
+    recursive HA-open formula, not a body-only approximation."""
+    if df is None or df.empty:
+        return None
+    ha_open=None; last=None
+    for row in df.sort_values("date").itertuples(index=False):
+        o,h,l,c=float(row.open),float(row.high),float(row.low),float(row.close)
+        ha_close=(o+h+l+c)/4.0
+        if ha_open is None:
+            ha_open=(o+c)/2.0
+        else:
+            ha_open=(ha_open+last)/2.0
+        ha_high=max(h,ha_open,ha_close)
+        ha_low=min(l,ha_open,ha_close)
+        last=ha_close
+    return {"open":ha_open,"close":last,"high":ha_high,"low":ha_low,"color":"green" if last>=ha_open else "red"}
+
+
 def _analyze_one_psx_divergence_symbol(symbol, start_date):
     """Fetches and analyzes a single symbol for the divergence scan.
     Pulled out into its own function so the scan can run several of
@@ -4585,8 +4642,16 @@ def _analyze_one_psx_divergence_symbol(symbol, start_date):
 
     multi_tf = compute_multi_timeframe_divergence(full_df, df)
 
+    # Personalized RSI zones + Heikin-Ashi confirmation. These are explicit
+    # filters, not relabelled daily data.
+    ha = _latest_heikin_ashi(df)
+    ha_color = ha["color"] if ha else "—"
+    bullish = core.check_bullish_divergence(df, PSX_DIVERGENCE_LOOKBACK_DAYS, PSX_DIVERGENCE_SWING_ORDER)
+    bearish = core.check_bearish_divergence(df, PSX_DIVERGENCE_LOOKBACK_DAYS, PSX_DIVERGENCE_SWING_ORDER)
     def _tf_label(tf):
         return (tf["type"].capitalize() if tf else "—")
+
+    structure = core.classify_structure(df, PSX_STRUCTURE_LOOKBACK_DAYS, PSX_STRUCTURE_SWING_ORDER)
 
     base_info = {
         "symbol": symbol,
@@ -4597,11 +4662,18 @@ def _analyze_one_psx_divergence_symbol(symbol, start_date):
         "div_1d": _tf_label(multi_tf["div_1d"]),
         "div_1w": _tf_label(multi_tf["div_1w"]),
         "div_1m": _tf_label(multi_tf["div_1m"]),
+        "structure": structure or "—",
+        "bullish_rsi_30": bool(bullish and bullish.get("pivot2_rsi") is not None and bullish.get("pivot2_rsi") <= 30),
+        "bullish_rsi_50": bool(bullish and bullish.get("pivot2_rsi") is not None and bullish.get("pivot2_rsi") <= 50),
+        "bearish_rsi_70": bool(bearish and bearish.get("pivot2_rsi") is not None and bearish.get("pivot2_rsi") >= 70),
+        "bearish_rsi_90": bool(bearish and bearish.get("pivot2_rsi") is not None and bearish.get("pivot2_rsi") >= 90),
+        "ha_color": ha_color,
+        "ha_bullish_confirmation": bool(ha_color == "green"),
+        "ha_bearish_confirmation": bool(ha_color == "red"),
+        "bullish_pivot2_rsi": bullish.get("pivot2_rsi") if bullish else None,
+        "bearish_pivot2_rsi": bearish.get("pivot2_rsi") if bearish else None,
+        "personalized_match": bool(is_near_low or bullish or bearish or multi_tf["div_1w"] or multi_tf["div_1m"]),
     }
-
-    bullish = core.check_bullish_divergence(df, PSX_DIVERGENCE_LOOKBACK_DAYS, PSX_DIVERGENCE_SWING_ORDER)
-    bearish = core.check_bearish_divergence(df, PSX_DIVERGENCE_LOOKBACK_DAYS, PSX_DIVERGENCE_SWING_ORDER)
-    structure = core.classify_structure(df, PSX_STRUCTURE_LOOKBACK_DAYS, PSX_STRUCTURE_SWING_ORDER)
 
     return {
         "symbol": symbol,
@@ -4701,6 +4773,7 @@ def run_psx_divergence_scan(progress_cb=None):
     near_low_hits, divergence_hits = [], []
     bullish_all_hits, bearish_all_hits = [], []
     uptrend_hits, downtrend_hits = [], []
+    personalized_hits = []
     errors = []
 
     total = len(tickers)
@@ -4726,6 +4799,8 @@ def run_psx_divergence_scan(progress_cb=None):
 
             base_info = result["base_info"]
             bullish, bearish, structure = result["bullish"], result["bearish"], result["structure"]
+            if base_info.get("personalized_match"):
+                personalized_hits.append(dict(base_info))
 
             if result["is_near_low"]:
                 near_low_hits.append(dict(base_info))
@@ -4761,6 +4836,7 @@ def run_psx_divergence_scan(progress_cb=None):
         "bearish_divergence_all": sort_hits(bearish_all_hits, "symbol"),
         "uptrend_divergence": sort_hits(uptrend_hits, "symbol"),
         "downtrend_divergence": sort_hits(downtrend_hits, "symbol"),
+        "personalized_matches": sort_hits(personalized_hits, "symbol"),
         "errors": errors,
         "symbols_scanned": total,
         "universe_count": total,
@@ -5187,6 +5263,7 @@ def stock_chart(symbol):
     if chart_df is None or chart_df.empty or len(chart_df) < CHART_MIN_CANDLES:
         return safe_jsonify({"available": False, "symbol": symbol.upper(), "note": "Not enough price history for this timeframe yet."})
 
+    chart_df = _sanitize_ohlcv(chart_df)
     candles, volume = _ohlc_to_candles_and_volume(chart_df)
     indicators = compute_chart_indicator_series(chart_df)
 
@@ -5194,6 +5271,7 @@ def stock_chart(symbol):
         "available": True,
         "symbol": symbol.upper(),
         "timeframe": timeframe,
+        "data_source": "PSX-compatible historical OHLCV provider chain (real market data)",
         "candles": candles,
         "volume": volume,
         "indicators": indicators,

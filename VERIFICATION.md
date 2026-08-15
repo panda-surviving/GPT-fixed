@@ -1,112 +1,69 @@
-# PSX Hub — Verification & Change Log
+# PSX Hub v4 — Verification & Change Log
 
-## What was fixed
+## v4 fixes implemented
 
-1. **PSX Divergence Screener**
-   - Reuses the existing PSX historical-data infrastructure.
-   - Added a 6-hour in-process OHLCV cache so a repeated scan does not re-download the same stock history.
-   - Reduced historical-request concurrency from 6 to 4 to avoid the burst pattern that was producing PSX connection/timeout failures.
-   - Added PSX AJAX-style request headers and a 15-second per-attempt timeout with the existing retry adapter.
-   - Daily, weekly and monthly divergence are computed on separate bars. Weekly/monthly values come from real OHLCV resampling (`W` / `ME`), not relabelled daily results.
-   - The scan remains a background job, so the browser does not sit on a long HTTP request.
+### 1. Complete PSX equity universe — no 10-stock masquerade
+- The **All PSX Stocks** directory now treats the official PSX **Eligible Scrips → Regular Deliverable Equity Market** as the authoritative universe.
+- The JSON `/symbols` endpoint is accepted only when it demonstrably contains a large directory (100+ entries). A 10-symbol development response is rejected as partial data.
+- `/api/symbols` no longer returns the 10-symbol development snapshot. On a true upstream outage it returns an explicit 503 instead of misleadingly displaying 10 stocks.
+- The divergence scan uses `get_symbols_for_full_scan()` and therefore cannot silently scan the development fallback.
+- The official PSX Eligible Scrips page currently exposes the regular equity directory; this is the source the deployed app is designed to use.
 
-2. **Mutual Funds**
-   - The API is now cache-first and never waits on the 20-second MUFAP scrape during a cold start.
-   - A complete bundled MUFAP directory is returned immediately if live NAV data is unavailable.
-   - Live MUFAP refresh runs in the background and is single-flight guarded.
-   - JSON cleaning remains enabled to convert NaN/Infinity to `null` before browser serialization.
+### 2. Personalized PSX Divergence Screener
+The screen now visibly documents and returns the requested rules rather than only showing generic divergence lists:
+- 52-week low proximity: within **3%** of the 52-week low.
+- RSI divergence independently calculated on **1D, 1W and 1M** bars.
+- Bullish divergence pivot RSI flags at **≤30** and **≤50**.
+- Bearish divergence pivot RSI flags at **≥70** and **≥90**.
+- True recursive **Heikin-Ashi** latest-candle confirmation.
+- Higher-high/higher-low vs lower-high/lower-low structure.
+- Master **Personalized PSX Setup — All Matches** table with the above columns.
+- Existing dedicated sections remain: 52W-low + bullish divergence, all near-low stocks, all bullish divergence, all bearish divergence, uptrend divergence and downtrend divergence.
+- Scan progress reports the actual universe count, checked count, usable-history count and failures.
 
-3. **All PSX Stocks / Screener performance**
-   - Symbol directory is non-blocking on cold start.
-   - Duplicate background directory refreshes are prevented with a single-flight lock.
-   - Existing quote/technical caches remain in place.
+### 3. Interactive chart / Price Graph
+- The stock-detail **Price Graph** now falls back to the real historical chart data when PSX intraday data is unavailable. It no longer disappears simply because the intraday endpoint fails.
+- Interactive chart continues to use real historical OHLCV and Lightweight Charts.
+- Added backend and frontend OHLC validation so malformed upstream `high`/`low` values cannot draw impossible candle wicks to zero.
+- This specifically addresses the screenshot where vertical lines extended abnormally far below the candle bodies.
+- The vertical line on a normal candlestick is a wick; the v4 sanitizer removes only malformed/extreme values, not legitimate wicks.
+- Volume, RSI, MACD, SMA20/50/200, EMA20/50/200 and classic S/R remain available.
+- Chart API now identifies its real-market-data provider chain in `data_source`.
+- Static app asset query string and service-worker cache are both bumped to v4.
 
-4. **Interactive stock charts**
-   - Keeps the existing Lightweight Charts implementation and real PSX OHLCV source.
-   - Added a CDN fallback from unpkg to jsDelivr.
-   - Added `requestAnimationFrame()` before chart construction so charts are initialized after the stock-detail layout has a real width.
-   - Added `fitContent()` after data loads and more robust resize handling.
-   - Candles, volume, SMA/EMA, RSI, MACD and classic support/resistance lines remain connected to the same real PSX history cache.
-   - Service-worker cache version was bumped so an old cached JavaScript bundle is not silently reused.
+### 4. Stock quote robustness
+- `/api/stock/<symbol>` always returns JSON even if the optional intraday provider throws an exception.
+- The exact browser-visible `The string did not match the expected pattern.` failure can no longer blank the whole stock-detail response merely because intraday data failed.
 
-5. **Technical verdict / pivots**
-   - Weighted 0–100 score remains transparent and bounded.
-   - Breakdown `contribution` now means actual weighted score contribution rather than the unweighted -100..100 signal.
-   - Pivot calculations use the most recent **completed** trading day; today's in-progress PSX bar is excluded when available.
-   - Classic P/S1-S3/R1-R3 and Fibonacci 38.2%/61.8%/100% levels are both returned.
+### 5. Existing financial features retained
+- Financial announcements and official financial/analysis report destinations remain included on stock detail and News.
+- Mutual Funds JSON safety/cache fixes remain included.
+- Consolidated technical verdict and classic/Fibonacci pivot calculations remain included.
 
-## Verification performed in this build environment
+## Local verification completed
 
-### Passed
+PASS:
+- `python -m py_compile app.py psx_screener.py`
+- `node --check static/app.js`
+- `node --check static/sw.js`
+- `python tests/test_frontend_static.py`
+- `pytest -q tests/test_math.py tests/test_regression_static.py` → **6 passed**
+- Static regression confirms the full-scan route uses `get_symbols_for_full_scan()` and does not contain a `FALLBACK_QUOTES` scan path.
+- Static regression confirms the historical PSX POST shape includes `month`, `year`, and `symbol`.
+- Static regression confirms chart, RSI, EMA/SMA, pivot and financial-announcement UI wiring.
 
-- Python compilation of `app.py` and `psx_screener.py`.
-- Node syntax validation of `static/app.js` and `static/sw.js`.
-- Pivot formula regression tests.
-- Fibonacci pivot formula regression tests.
-- RSI bounds test.
-- True weekly/monthly OHLCV resampling test.
-- Synthetic technical-verdict test: score is bounded 0–100 and weighted contributions sum to `score - 50`.
-- Synthetic chart-series test: SMA/EMA/RSI/MACD series lengths and candle data are internally consistent.
-- Synthetic endpoint-shape tests for the chart route and divergence scan start route.
-- Mutual-fund fallback test confirms 392 bundled funds are returned and NaN/Infinity are converted to JSON-safe nulls.
-- Static frontend wiring checks for mutual funds, divergence, chart endpoint, Lightweight Charts and service-worker cache version.
+A separate `tests/test_v4_regressions.py` is included for a real Flask environment. It covers malformed OHLC wick sanitization, stock-detail JSON resilience, rejection of the 10-symbol directory fallback, full-universe scan accounting, and recursive Heikin-Ashi calculation. This sandbox does not have Flask installed and has no outbound package/network access, so that Flask endpoint suite could not be executed here. The source itself compiles successfully.
 
-Run the included checks with:
+## Live deployment verification still required
 
-```bash
-python tests/test_math.py
-python tests/test_frontend_static.py
-python -m py_compile app.py psx_screener.py
-node --check static/app.js
-node --check static/sw.js
-```
+This build environment cannot establish outbound HTTPS connections to PSX/Yahoo/MUFAP and cannot interact with the user's Render deployment. Therefore I am **not** claiming a live 700+ stock scan was executed here.
 
-## Important limitation of this verification
-
-A true live Render/PSX end-to-end test could **not** be completed inside this build sandbox. The sandbox has no DNS/network access to install Flask or make outbound HTTPS requests to `dps.psx.com.pk` / MUFAP, so it would be misleading to claim that a real PSX scan, live MUFAP request, or deployed Render browser session was successfully exercised here.
-
-The code was therefore tested at the calculation, route-shape, serialization, JavaScript syntax, and UI-wiring levels, while the external PSX/MUFAP calls were isolated rather than faked as successful live results.
-
-For final deployment verification, the required live checks are:
-
-1. Open `/healthz` after Render wakes from idle.
-2. Open **All PSX Stocks** immediately after wake-up and confirm the fallback/warming state changes to the real PSX directory.
-3. Open **Mutual Funds** and confirm the table renders immediately, then confirm live NAV/source updates after the background refresh.
-4. Run **PSX Divergence Screener** and allow the background job to finish; confirm 1D/1W/1M columns differ where the underlying bars differ.
-5. Open a liquid stock such as OGDC/FFC and confirm candles + volume + RSI + MACD render from real PSX data.
-6. Toggle SMA/EMA and S/R, change 1M/3M/6M/1Y/3Y/5Y/ALL, resize the browser, and confirm no new network request occurs for indicator toggles and no blank chart appears.
-7. Open the technical verdict and confirm the pivot basis date is the latest completed trading session.
-
-
-## Second-pass fixes (2026-08-15)
-
-- Added a second PSX-hosted data portal (`dps.csapis.com`) as a transparent fallback for the symbol directory, company pages, intraday series, and historical OHLCV endpoint. This addresses the Render error shown in the supplied screenshot where `dps.psx.com.pk` was closing connections.
-- Added a complete Eligible Scrips HTML-directory fallback so the divergence scanner does not intentionally fall back to the 10 development symbols when the JSON symbol endpoint is unavailable.
-- Increased the divergence scanner's market-wide worker pool from 4 to 6 and its directory cold-start grace period from 30s to 90s. It now reports `symbols_scanned`, `symbols_with_data`, and `symbols_failed` rather than implying a 10-symbol scan was a full-market scan.
-- Added live PSX financial-announcement/report retrieval and official PSX report destinations to the News page and every stock detail page.
-- Added a cache-busted `app.js` URL to prevent an old service-worker/browser asset from masking the new frontend.
-
-### Second-pass local verification
-
-- Python compilation: PASS.
-- JavaScript syntax (`node --check`): PASS.
-- Mathematical regression tests: PASS.
-- Static frontend wiring test: PASS.
-- The sandbox cannot make outbound HTTPS connections to PSX, so a real Render-hosted market-wide scan and browser interaction against the live PSX service could not be truthfully claimed here. The alternate PSX host was independently confirmed as a live PSX data-portal host during implementation.
-
-## Production screenshot regression — v3
-
-The August 15, 2026 screenshots were used as a regression target. The error text `The string did not match the expected pattern.` was traced to the historical-data request path. The previous implementation POSTed only `symbol` to `/historical`; current PSX historical requests require month/year/symbol parameters. The v3 provider chain removes that invalid request as the primary path and adds a multi-provider fallback.
-
-### Verified statically in this environment
-
-- Python syntax: PASS (`app.py`, `psx_screener.py`)
-- JavaScript syntax: PASS (`static/app.js`, `static/sw.js`)
-- Regression tests: PASS (provider request shape, full-universe guard, provider fallbacks, monthly resampling, visible indicator/pivot UI, service-worker cache bump)
-- Full-scan route: confirmed it calls `get_symbols_for_full_scan()` and cannot silently scan the 10-symbol development fallback.
-- Chart route: confirmed it uses the same real historical OHLCV provider chain as the verdict and returns candlesticks, volume, SMA/EMA, RSI, MACD and pivot points.
-- Technical values: confirmed the API already returns RSI, MACD, SMA20/50/200 and EMA20/50/200; v3 now renders these values visibly in the stock-detail page.
-
-### Live verification limitation
-
-This sandbox cannot establish outbound HTTPS connections to PSX or Yahoo Finance, so a live 700+ symbol scan against Render cannot be truthfully claimed from this environment. The build therefore does not label the scan as live-verified. After deployment, the first required check is `/api/psxdivergence/scan/start` followed by `/api/psxdivergence/scan/status/<job_id>` until `status=done`; the UI must report the complete universe count rather than 10.
+After deploying v4, verify:
+1. `/api/symbols` returns the full PSX regular-equity directory and **not 10**.
+2. **All PSX Stocks** shows the same directory count.
+3. **Divergence Screener → Run Scan** reports the actual universe count and progresses through every symbol.
+4. A stock detail page shows the Price Graph even when intraday PSX data is unavailable, using the real historical chart fallback.
+5. Interactive candles have normal OHLC wicks; no repeated vertical lines dropping to an impossible zero/baseline.
+6. 1M/3M/6M/1Y/3Y/5Y/ALL, SMA/EMA, RSI, MACD and S/R toggles render correctly.
+7. The Personalized PSX Setup table contains 1D/1W/1M divergence and RSI-zone columns.
+8. Financial announcements/reports and Mutual Funds continue to load.

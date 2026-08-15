@@ -1,4 +1,4 @@
-const CACHE = "psx-360-shell-v3";
+const CACHE = "psx-360-shell-v4";
 const APP_SHELL = ["/", "/static/style.css", "/static/app.js", "/static/images/yalvon360-logo.png"];
 
 self.addEventListener("install", event => {

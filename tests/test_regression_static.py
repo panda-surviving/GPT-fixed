@@ -38,4 +38,4 @@ def test_indicator_values_and_pivots_are_rendered():
 
 
 def test_service_worker_cache_is_bumped():
-    assert 'psx-360-shell-v3' in SW
+    assert 'psx-360-shell-v4' in SW

@@ -1214,10 +1214,20 @@ async function openStock(symbol) {
     const series = Array.isArray(d.series) ? d.series : [];
     const values = series.map(x => Number(x.y)).filter(Number.isFinite);
 
-    $("stockDetailChart").innerHTML =
-      values.length
-        ? makeSvgLine(values, "detail-line")
-        : `<div class="empty-chart">Intraday graph is not available from the current response.</div>`;
+    $("stockDetailChart").innerHTML = values.length
+      ? makeSvgLine(values, "detail-line")
+      : `<div class="loading-panel">Loading daily price graph…</div>`;
+    if (!values.length) {
+      try {
+        const cd = await getJSON(`/api/stock/${encodeURIComponent(symbol)}/chart?timeframe=1M`);
+        const closes = (cd.candles || []).map(x => Number(x.close)).filter(Number.isFinite);
+        $("stockDetailChart").innerHTML = closes.length >= 2
+          ? makeSvgLine(closes, "detail-line")
+          : `<div class="empty-chart">Price graph unavailable from PSX history right now.</div>`;
+      } catch (_) {
+        $("stockDetailChart").innerHTML = `<div class="empty-chart">Price graph unavailable from PSX history right now.</div>`;
+      }
+    }
 
     $("stockRanges").innerHTML =
       renderRange("Day Range", d.day_low, d.price, d.day_high) +
@@ -3783,13 +3793,18 @@ const PSX_DIV_COLS = [
   { key: "latest_close", label: "Last Close", fmt: "num2" },
   { key: "week52_low", label: "52W Low", fmt: "num2" },
   { key: "pct_above_52w_low", label: "% Above 52W Low", fmt: "pct" },
-  { key: "latest_rsi", label: "RSI (14)" },
+  { key: "latest_rsi", label: "RSI (14)", fmt: "num1" },
   { key: "div_1d", label: "1D Divergence" },
   { key: "div_1w", label: "1W Divergence" },
   { key: "div_1m", label: "1M Divergence" },
-  { key: "divergence_type", label: "Type" },
-  { key: "pivot1_date", label: "Pivot 1" },
-  { key: "pivot2_date", label: "Pivot 2" },
+  { key: "bullish_pivot2_rsi", label: "Bull Div RSI", fmt: "num1" },
+  { key: "bearish_pivot2_rsi", label: "Bear Div RSI", fmt: "num1" },
+  { key: "bullish_rsi_30", label: "Bull Div ≤30" },
+  { key: "bullish_rsi_50", label: "Bull Div ≤50" },
+  { key: "bearish_rsi_70", label: "Bear Div ≥70" },
+  { key: "bearish_rsi_90", label: "Bear Div ≥90" },
+  { key: "ha_color", label: "Heikin-Ashi" },
+  { key: "structure", label: "Structure" },
 ];
 
 function renderPsxDivTable(rows, cols) {
@@ -3805,6 +3820,7 @@ function renderPsxDivTable(rows, cols) {
       let val = r[c.key];
       if (val === null || val === undefined) val = "—";
       else if (c.fmt === "num2" && typeof val === "number") val = val.toFixed(2);
+      else if (c.fmt === "num1" && typeof val === "number") val = val.toFixed(1);
       else if (c.fmt === "pct" && typeof val === "number") val = `${val.toFixed(2)}%`;
       else val = esc(String(val));
       return `<td>${val}</td>`;
@@ -3816,12 +3832,13 @@ function renderPsxDivTable(rows, cols) {
 
 function renderPsxDivergenceResult(result, resultsEl) {
   const sections = [
-    ["near_low_bullish_divergence", "Near 52-Week Low + Bullish RSI Divergence", "Price near its 52-week low, with RSI making a higher low while price made a lower low — a possible sign of fading downside momentum right where it matters most."],
-    ["near_low", "All Stocks Near Their 52-Week Low", "Every screened stock within a few percent of its 52-week low (not all of these show divergence)."],
-    ["bullish_divergence_all", "All Bullish RSI Divergence (market-wide)", "Every stock showing a bullish divergence anywhere in the market, regardless of where it sits relative to its 52-week low."],
-    ["bearish_divergence_all", "All Bearish RSI Divergence (market-wide)", "The mirror image: price made a higher high while RSI made a lower high — a possible sign of fading upside momentum."],
-    ["uptrend_divergence", "Divergence Within an Uptrend Structure", "Higher-high + higher-low swing structure, also showing a divergence — see the Type column."],
-    ["downtrend_divergence", "Divergence Within a Downtrend Structure", "Lower-high + lower-low swing structure, also showing a divergence — see the Type column."],
+    ["personalized_matches", "Personalized PSX Setup — All Matches", "A stock appears here when it meets at least one requested condition: within 3% of its 52-week low, RSI divergence on 1D/1W/1M, bullish divergence with pivot RSI ≤30 or ≤50, bearish divergence with pivot RSI ≥70 or ≥90, or a Heikin-Ashi/trend confirmation."],
+    ["near_low_bullish_divergence", "52-Week Low + Bullish RSI Divergence", "Price is within the configured 3% of its 52-week low AND has a mathematically confirmed bullish RSI divergence."],
+    ["near_low", "All Stocks Near Their 52-Week Low", "Every scanned stock within 3% of its 52-week low."],
+    ["bullish_divergence_all", "All Bullish RSI Divergence — Market Wide", "Every stock with confirmed bullish divergence, independent of its 52-week position."],
+    ["bearish_divergence_all", "All Bearish RSI Divergence — Market Wide", "Every stock with confirmed bearish divergence, independent of its 52-week position."],
+    ["uptrend_divergence", "Divergence Within an Uptrend", "Confirmed divergence occurring in a higher-high/higher-low structure."],
+    ["downtrend_divergence", "Divergence Within a Downtrend", "Confirmed divergence occurring in a lower-high/lower-low structure."],
   ];
 
   let html = "";
@@ -3984,7 +4001,13 @@ function renderStockChart(d) {
     borderUpColor: CHART_COLORS.up, borderDownColor: CHART_COLORS.down,
     wickUpColor: CHART_COLORS.up, wickDownColor: CHART_COLORS.down,
   });
-  candleSeries.setData(d.candles);
+  // The backend sanitizes OHLC, but clamp again at the UI boundary so a
+  // single malformed upstream candle can never draw a wick to zero.
+  const safeCandles = (d.candles || []).filter(x => [x.open,x.high,x.low,x.close].every(Number.isFinite)).map(x => {
+    const bodyHi=Math.max(x.open,x.close), bodyLo=Math.min(x.open,x.close);
+    return {...x, high: (x.high > 0 && x.high >= bodyHi && x.high <= bodyHi*5) ? x.high : bodyHi, low: (x.low > 0 && x.low <= bodyLo && x.low >= bodyLo/5) ? x.low : bodyLo};
+  });
+  candleSeries.setData(safeCandles);
   priceChart.timeScale().fitContent();
 
   volumeChartInstance = LightweightCharts.createChart(volEl, chartBaseOptions(volEl));

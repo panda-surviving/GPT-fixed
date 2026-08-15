@@ -1479,10 +1479,11 @@
       <button id="psxDivergenceRunBtn" class="primary">Run Scan</button>
     </div>
     <p class="muted-note live-data-notice">
-      Walks every PSX symbol's ~1 year of daily price history and flags: stocks near their 52-week low,
-      bullish/bearish RSI divergence anywhere in the market, and divergences that sit within an uptrend or
-      downtrend structure. A full market scan takes several minutes on first run since it covers 700+
-      symbols one at a time — results are cached so reopening this tab shows your last scan instantly.
+      Checks the complete PSX regular-equity universe — never the 10-symbol development snapshot. It tests the
+      52-week-low condition (within 3%), mathematically confirmed RSI divergence separately on 1D, 1W and 1M,
+      bullish divergence with RSI at the second pivot ≤30 and ≤50, bearish divergence with RSI at the second pivot
+      ≥70 and ≥90, Heikin-Ashi confirmation, and higher-high/higher-low vs lower-high/lower-low structure.
+      A full market scan can take several minutes on a Render free-tier instance; results are cached.
       This is a technical screen, not investment advice.
     </p>
     <p id="psxDivergenceStatus" class="muted-note"></p>
@@ -1965,7 +1966,7 @@
 
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"
         onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js'"></script>
-<script src="{{ url_for('static', filename='app.js', v='20260815-2') }}"></script>
+<script src="{{ url_for('static', filename='app.js', v='20260815-4') }}"></script>
 <script>
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
