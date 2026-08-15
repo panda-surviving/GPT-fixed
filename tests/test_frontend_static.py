@@ -23,3 +23,5 @@ for needle in required:
 assert "lightweight-charts@4.1.3" in html
 assert "psx-360-shell-v2" in sw
 print("PASS: mutual-funds, divergence, chart endpoints, Lightweight Charts, RSI and cache version are wired")
+assert "dps.csapis.com" in (ROOT / "app.py").read_text()
+assert "/api/psx/financials" in js and "Financial Announcements" in html

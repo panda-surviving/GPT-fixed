@@ -76,3 +76,20 @@ For final deployment verification, the required live checks are:
 5. Open a liquid stock such as OGDC/FFC and confirm candles + volume + RSI + MACD render from real PSX data.
 6. Toggle SMA/EMA and S/R, change 1M/3M/6M/1Y/3Y/5Y/ALL, resize the browser, and confirm no new network request occurs for indicator toggles and no blank chart appears.
 7. Open the technical verdict and confirm the pivot basis date is the latest completed trading session.
+
+
+## Second-pass fixes (2026-08-15)
+
+- Added a second PSX-hosted data portal (`dps.csapis.com`) as a transparent fallback for the symbol directory, company pages, intraday series, and historical OHLCV endpoint. This addresses the Render error shown in the supplied screenshot where `dps.psx.com.pk` was closing connections.
+- Added a complete Eligible Scrips HTML-directory fallback so the divergence scanner does not intentionally fall back to the 10 development symbols when the JSON symbol endpoint is unavailable.
+- Increased the divergence scanner's market-wide worker pool from 4 to 6 and its directory cold-start grace period from 30s to 90s. It now reports `symbols_scanned`, `symbols_with_data`, and `symbols_failed` rather than implying a 10-symbol scan was a full-market scan.
+- Added live PSX financial-announcement/report retrieval and official PSX report destinations to the News page and every stock detail page.
+- Added a cache-busted `app.js` URL to prevent an old service-worker/browser asset from masking the new frontend.
+
+### Second-pass local verification
+
+- Python compilation: PASS.
+- JavaScript syntax (`node --check`): PASS.
+- Mathematical regression tests: PASS.
+- Static frontend wiring test: PASS.
+- The sandbox cannot make outbound HTTPS connections to PSX, so a real Render-hosted market-wide scan and browser interaction against the live PSX service could not be truthfully claimed here. The alternate PSX host was independently confirmed as a live PSX data-portal host during implementation.

@@ -1734,6 +1734,16 @@
       </div>
     </div>
 
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h3>Financial Announcements &amp; Reports</h3>
+          <p>Official PSX company filings, financial results, reports and notices.</p>
+        </div>
+      </div>
+      <div id="stockFinancialsBody"><div class="loading-panel">Loading PSX filings…</div></div>
+    </div>
+
   </section>
 
 
@@ -1824,7 +1834,29 @@
         <p>Company and market updates.</p>
       </div>
     </div>
-    <div id="announcementList"></div>
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h3>Latest PSX Financial Announcements</h3>
+          <p>Live company notices and financial-result filings from the official PSX data portal.</p>
+        </div>
+        <a class="primary" href="https://dps.csapis.com/announcements/companies" target="_blank" rel="noopener">Open PSX Announcements</a>
+      </div>
+      <div id="announcementList"></div>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <h3>Financial Reports &amp; Research</h3>
+          <p>Official PSX financial-report repository and analysis reports.</p>
+        </div>
+      </div>
+      <div class="cards three">
+        <a class="card clickable-row" href="https://financials.psx.com.pk/" target="_blank" rel="noopener"><strong>PSX Financial Reports</strong><span>Annual, half-yearly and quarterly company financial reports.</span></a>
+        <a class="card clickable-row" href="https://dps.csapis.com/analysis-reports" target="_blank" rel="noopener"><strong>PSX Analysis Reports</strong><span>Official exchange analysis-report archive.</span></a>
+        <a class="card clickable-row" href="https://dps.csapis.com/downloads" target="_blank" rel="noopener"><strong>PSX Downloads</strong><span>Daily and historical market downloads.</span></a>
+      </div>
+    </div>
   </section>
 
 </main>
@@ -1933,7 +1965,7 @@
 
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"
         onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js'"></script>
-<script src="{{ url_for('static', filename='app.js') }}"></script>
+<script src="{{ url_for('static', filename='app.js', v='20260815-2') }}"></script>
 <script>
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));

@@ -85,6 +85,15 @@ app = Flask(__name__)
 PSX_SYMBOLS_URL = "https://dps.psx.com.pk/symbols"
 PSX_COMPANY_URL = "https://dps.psx.com.pk/company/{symbol}"
 PSX_INTRADAY_URL = "https://dps.psx.com.pk/timeseries/int/{symbol}"
+# PSX operates a second public data-portal hostname (dps.csapis.com) that
+# serves the same PSX data pages. Render/free-tier instances can sometimes
+# resolve/reach this host when dps.psx.com.pk is temporarily unavailable.
+PSX_ALT_BASE = "https://dps.csapis.com"
+PSX_ALT_SYMBOLS_URL = f"{PSX_ALT_BASE}/symbols"
+PSX_ALT_COMPANY_URL = f"{PSX_ALT_BASE}/company/{{symbol}}"
+PSX_ALT_INTRADAY_URL = f"{PSX_ALT_BASE}/timeseries/int/{{symbol}}"
+PSX_ALT_ELIGIBLE_URL = f"{PSX_ALT_BASE}/eligible-scrips"
+
 
 HEADERS = {
     "User-Agent": (
@@ -1547,43 +1556,71 @@ def fetch_psx_symbols(force=False):
         ):
             return _symbol_cache["items"]
 
-    response = _http_session.get(
-        PSX_SYMBOLS_URL,
-        headers=HEADERS,
-        timeout=20
-    )
-    response.raise_for_status()
-    raw = response.json()
+    last_exc = None
+    # First try the lightweight JSON directory, then the alternate PSX
+    # hostname, then the public Eligible Scrips HTML table. The latter is
+    # important because it contains the complete regular equity directory,
+    # not a ten-symbol development fallback.
+    for url in (PSX_SYMBOLS_URL, PSX_ALT_SYMBOLS_URL):
+        try:
+            response = _http_session.get(url, headers=HEADERS, timeout=12)
+            response.raise_for_status()
+            raw = response.json()
+            items, seen = [], set()
+            for row in raw:
+                if row.get("isDebt") or row.get("isETF"):
+                    continue
+                symbol = str(row.get("symbol", "")).strip().upper()
+                company = str(row.get("name", "")).strip()
+                sector = str(row.get("sectorName", "")).strip()
+                if not symbol or symbol in seen:
+                    continue
+                seen.add(symbol)
+                items.append({"symbol": symbol, "company": company, "sector": sector})
+            if items:
+                items.sort(key=lambda x: x["symbol"])
+                with _symbol_lock:
+                    _symbol_cache["items"] = items
+                    _symbol_cache["time"] = now
+                return items
+        except (requests.RequestException, ValueError) as exc:
+            last_exc = exc
 
-    items = []
-    seen = set()
+    try:
+        response = _http_session.get(PSX_ALT_ELIGIBLE_URL, headers=HEADERS, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        items, seen = [], set()
+        # Prefer the Regular Deliverable Equity Market table. If markup is
+        # changed, accepting the first symbol/name table still gives a useful
+        # complete directory rather than silently falling back to ten names.
+        for table in soup.find_all("table"):
+            rows = table.find_all("tr")
+            if not rows:
+                continue
+            for row in rows:
+                cells = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"])]
+                if len(cells) < 2:
+                    continue
+                symbol, company = cells[0].strip().upper(), cells[1].strip()
+                if symbol in {"SYMBOL", "NAME"} or not symbol or not re.match(r"^[A-Z0-9&.-]{1,30}$", symbol):
+                    continue
+                if symbol in seen:
+                    continue
+                seen.add(symbol)
+                items.append({"symbol": symbol, "company": company, "sector": ""})
+        if items:
+            items.sort(key=lambda x: x["symbol"])
+            with _symbol_lock:
+                _symbol_cache["items"] = items
+                _symbol_cache["time"] = now
+            return items
+    except requests.RequestException as exc:
+        last_exc = exc
 
-    for row in raw:
-        if row.get("isDebt") or row.get("isETF"):
-            continue
-
-        symbol = str(row.get("symbol", "")).strip().upper()
-        company = str(row.get("name", "")).strip()
-        sector = str(row.get("sectorName", "")).strip()
-
-        if not symbol or symbol in seen:
-            continue
-
-        seen.add(symbol)
-        items.append({
-            "symbol": symbol,
-            "company": company,
-            "sector": sector,
-        })
-
-    items.sort(key=lambda x: x["symbol"])
-
-    with _symbol_lock:
-        _symbol_cache["items"] = items
-        _symbol_cache["time"] = now
-
-    return items
-
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("PSX symbol directory returned no symbols")
 
 def _fallback_symbol_directory():
     return [
@@ -1792,30 +1829,30 @@ def get_quote(symbol, force=False):
         ):
             return cached["quote"]
 
-    url = PSX_COMPANY_URL.format(symbol=symbol)
+    last_exc = None
+    for url in (PSX_COMPANY_URL.format(symbol=symbol), PSX_ALT_COMPANY_URL.format(symbol=symbol)):
+        try:
+            response = _http_session.get(url, headers=HEADERS, timeout=12)
+            response.raise_for_status()
+            quote = parse_company_page(symbol, response.text)
+
+            if quote.get("price") is None:
+                fallback = FALLBACK_QUOTES.get(symbol, {})
+                quote["price"] = fallback.get("price")
+                quote["change_pct"] = quote.get("change_pct") if quote.get("change_pct") is not None else fallback.get("change")
+                quote["volume"] = quote.get("volume") if quote.get("volume") is not None else fallback.get("volume")
+
+            quote["source"] = "PSX company page"
+            quote["fetched_at"] = now.isoformat(timespec="seconds")
+
+            with _quote_lock:
+                _quote_cache[symbol] = {"time": now, "quote": quote}
+            return quote
+        except requests.RequestException as exc:
+            last_exc = exc
 
     try:
-        response = _http_session.get(url, headers=HEADERS, timeout=15)
-        response.raise_for_status()
-        quote = parse_company_page(symbol, response.text)
-
-        if quote.get("price") is None:
-            fallback = FALLBACK_QUOTES.get(symbol, {})
-            quote["price"] = fallback.get("price")
-            quote["change_pct"] = quote.get("change_pct") if quote.get("change_pct") is not None else fallback.get("change")
-            quote["volume"] = quote.get("volume") if quote.get("volume") is not None else fallback.get("volume")
-
-        quote["source"] = "PSX company page"
-        quote["fetched_at"] = now.isoformat(timespec="seconds")
-
-        with _quote_lock:
-            _quote_cache[symbol] = {
-                "time": now,
-                "quote": quote
-            }
-
-        return quote
-
+        raise last_exc or requests.RequestException("PSX company page unavailable")
     except requests.RequestException as exc:
         fallback = FALLBACK_QUOTES.get(symbol)
         if fallback:
@@ -2749,15 +2786,18 @@ def normalize_timeseries(payload):
 
 
 def get_intraday(symbol):
-    url = PSX_INTRADAY_URL.format(symbol=symbol.upper())
-
-    try:
-        response = _http_session.get(url, headers=HEADERS, timeout=15)
-        response.raise_for_status()
-        payload = response.json()
-        return normalize_timeseries(payload)
-    except (requests.RequestException, ValueError):
-        return []
+    urls = [PSX_INTRADAY_URL.format(symbol=symbol.upper()), PSX_ALT_INTRADAY_URL.format(symbol=symbol.upper())]
+    for url in urls:
+        try:
+            response = _http_session.get(url, headers=HEADERS, timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+            points = normalize_timeseries(payload)
+            if points:
+                return points
+        except (requests.RequestException, ValueError):
+            continue
+    return []
 
 
 # ---------------------------------------------------------
@@ -3453,6 +3493,131 @@ def dashboard_highlights():
         "funds_source": funds_source,
         "commodities": commodities,
     })
+
+
+def _fetch_psx_html(paths, timeout=12):
+    """Fetch a PSX HTML page from the primary or alternate PSX data host."""
+    last = None
+    for path in paths:
+        url = path if path.startswith("http") else f"{PSX_ALT_BASE}{path}"
+        try:
+            r = _http_session.get(url, headers=HEADERS, timeout=timeout)
+            r.raise_for_status()
+            return r.text, url
+        except requests.RequestException as exc:
+            last = exc
+    raise last or requests.RequestException("PSX page unavailable")
+
+
+def parse_psx_announcement_page(html, limit=80):
+    soup = BeautifulSoup(html, "html.parser")
+    results, seen = [], set()
+    # PSX has changed the announcement markup more than once. Extract links
+    # and their nearest useful text rather than depending on one CSS class.
+    for a in soup.find_all("a", href=True):
+        text = " ".join(a.get_text(" ", strip=True).split())
+        href = a.get("href")
+        if not text or len(text) < 4:
+            continue
+        blob = text.lower()
+        if not any(k in blob for k in ("financial", "quarter", "half year", "annual", "board meeting", "report", "dividend", "material information", "results", "transmission")):
+            continue
+        key = (text, href)
+        if key in seen:
+            continue
+        seen.add(key)
+        if href.startswith("/"):
+            href = "https://dps.csapis.com" + href
+        elif href.startswith("http://"):
+            href = "https://" + href[7:]
+        results.append({"title": text, "url": href})
+        if len(results) >= limit:
+            break
+    return results
+
+
+@app.get("/api/psx/financials")
+def psx_financials():
+    """Live PSX corporate announcements + official report destinations.
+    The app never fabricates a financial filing; when PSX is temporarily
+    unreachable the endpoint returns the official destination links and a
+    clear source/error status."""
+    symbol = request.args.get("symbol", "").strip().upper()
+    limit = min(max(int(request.args.get("limit", 50) or 50), 1), 100)
+    result = {
+        "available": False,
+        "source": "Pakistan Stock Exchange",
+        "announcements": [],
+        "reports": [],
+        "official_links": {
+            "company_announcements": "https://dps.csapis.com/announcements/companies",
+            "financial_reports": "https://financials.psx.com.pk/",
+            "analysis_reports": "https://dps.csapis.com/analysis-reports",
+            "daily_downloads": "https://dps.csapis.com/downloads",
+        },
+        "symbol": symbol or None,
+    }
+    try:
+        if symbol:
+            html, source_url = _fetch_psx_html([
+                PSX_COMPANY_URL.format(symbol=symbol),
+                PSX_ALT_COMPANY_URL.format(symbol=symbol),
+            ])
+            soup = BeautifulSoup(html, "html.parser")
+            # Company pages expose filings as table rows whose document link
+            # often says only "View PDF". Read the whole row so the actual
+            # financial-result/report title is preserved.
+            for row in soup.find_all("tr"):
+                cells = [" ".join(c.get_text(" ", strip=True).split()) for c in row.find_all(["td", "th"])]
+                row_text = " | ".join(x for x in cells if x)
+                low = row_text.lower()
+                if not row_text or not any(k in low for k in ("report", "financial", "results", "announcement", "statement", "notice", "payout", "quarter", "half year", "annual")):
+                    continue
+                a = row.find("a", href=True)
+                if not a:
+                    continue
+                href = a.get("href")
+                if href.startswith("/"):
+                    href = "https://dps.csapis.com" + href
+                elif href.startswith("http://"):
+                    href = "https://" + href[7:]
+                if not href.startswith("http"):
+                    continue
+                result["announcements"].append({"title": row_text[:500], "url": href})
+                if len(result["announcements"]) >= limit:
+                    break
+
+            # Fallback for markup where filings are not inside table rows.
+            if not result["announcements"]:
+                for a in soup.find_all("a", href=True):
+                    text = " ".join(a.get_text(" ", strip=True).split())
+                    href = a.get("href")
+                    if not text:
+                        continue
+                    low = text.lower()
+                    if not any(k in low for k in ("report", "financial", "results", "announcement", "statement", "notice", "payout")):
+                        continue
+                    if href.startswith("/"):
+                        href = "https://dps.csapis.com" + href
+                    elif href.startswith("http://"):
+                        href = "https://" + href[7:]
+                    if href.startswith("http"):
+                        result["announcements"].append({"title": text, "url": href})
+                    if len(result["announcements"]) >= limit:
+                        break
+            result["available"] = bool(result["announcements"])
+            result["source_url"] = source_url
+        else:
+            html, source_url = _fetch_psx_html([
+                "https://dps.psx.com.pk/announcements/companies",
+                "https://dps.csapis.com/announcements/companies",
+            ])
+            result["announcements"] = parse_psx_announcement_page(html, limit)
+            result["available"] = bool(result["announcements"])
+            result["source_url"] = source_url
+    except Exception as exc:
+        result["error"] = str(exc)
+    return safe_jsonify(result)
 
 
 @app.get("/api/journal")
@@ -4216,20 +4381,28 @@ def fetch_psx_history_direct(symbol, max_retries=3, retry_delays=(1, 2)):
         "Accept": "text/html, */*;q=0.01",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     }
-    for attempt in range(max_retries):
-        try:
-            resp = _http_session.post(
-                PSX_HISTORICAL_URL, data={"symbol": symbol.upper()},
-                headers=request_headers, timeout=15,
-            )
-            resp.raise_for_status()
+    # Try the normal PSX hostname and then the alternate PSX data-portal
+    # hostname. The latter is a PSX-hosted mirror of the same public data
+    # portal and is substantially more reliable for some Render regions.
+    urls = [PSX_HISTORICAL_URL, f"{PSX_ALT_BASE}/historical"]
+    for base_url in urls:
+        for attempt in range(max_retries):
+            try:
+                resp = _http_session.post(
+                    base_url, data={"symbol": symbol.upper()},
+                    headers=request_headers, timeout=12,
+                )
+                resp.raise_for_status()
+                break
+            except requests.RequestException as e:
+                last_exc = e
+                resp = None
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delays[min(attempt, len(retry_delays) - 1)])
+        if resp is not None:
             break
-        except requests.RequestException as e:
-            last_exc = e
-            if attempt < max_retries - 1:
-                time.sleep(retry_delays[min(attempt, len(retry_delays) - 1)])
-                continue
-            raise RuntimeError(f"PSX unreachable for {symbol} after {max_retries} attempts: {e}") from e
+    if resp is None:
+        raise RuntimeError(f"PSX historical data unavailable for {symbol} after trying both PSX data hosts: {last_exc}") from last_exc
 
     soup = BeautifulSoup(resp.text, "html.parser")
     table = soup.find("table")
@@ -4390,7 +4563,7 @@ def _analyze_one_psx_divergence_symbol(symbol, start_date):
 # PSX throttles repeated historical POSTs fairly aggressively. Four workers
 # keeps the scan materially faster than serial requests without creating the
 # burst of simultaneous connections that caused the original timeout failures.
-PSX_DIVERGENCE_SCAN_WORKERS = 4
+PSX_DIVERGENCE_SCAN_WORKERS = 6
 PSX_DIVERGENCE_HISTORY_CACHE_HOURS = 6
 _psx_divergence_history_cache = {}
 _psx_divergence_history_cache_lock = threading.Lock()
@@ -4430,7 +4603,7 @@ def run_psx_divergence_scan(progress_cb=None):
     if not warmed:
         # The route itself remains instant; the background scan can wait briefly
         # for the real directory rather than scanning only the ten fallback names.
-        deadline = time.time() + 30
+        deadline = time.time() + 90
         while time.time() < deadline:
             try:
                 tickers = fetch_psx_symbols()
@@ -4511,6 +4684,9 @@ def run_psx_divergence_scan(progress_cb=None):
         "downtrend_divergence": sort_hits(downtrend_hits, "symbol"),
         "errors": errors,
         "symbols_scanned": total,
+        "symbols_with_data": total - len(errors),
+        "symbols_failed": len(errors),
+        "scan_complete": True,
     }
 
 

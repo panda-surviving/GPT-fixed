@@ -1231,9 +1231,26 @@ async function openStock(symbol) {
   }
 
   loadFundamentals(symbol);
+  loadStockFinancials(symbol);
   loadTechnicalVerdict(symbol);
   document.querySelectorAll(".chart-tf-btn").forEach(b => b.classList.toggle("active", b.dataset.tf === "1Y"));
   loadStockChart(symbol, "1Y");
+}
+
+async function loadStockFinancials(symbol) {
+  const el = $("stockFinancialsBody");
+  if (!el) return;
+  el.innerHTML = `<div class="loading-panel">Loading official PSX filings…</div>`;
+  try {
+    const d = await getJSON(`/api/psx/financials?symbol=${encodeURIComponent(symbol)}&limit=40`);
+    const links = d.announcements || [];
+    const cards = links.map(x => `<a class="announcement-card clickable-row" href="${esc(x.url)}" target="_blank" rel="noopener"><div class="announcement-symbol">PSX</div><div><strong>${esc(x.title)}</strong><small>Official PSX filing / announcement</small></div></a>`).join("");
+    const fallbackLinks = d.official_links ? `
+      <div class="muted-note" style="margin-top:12px">Official repositories: <a href="${esc(d.official_links.financial_reports)}" target="_blank" rel="noopener">Financial Reports</a> · <a href="${esc(d.official_links.analysis_reports)}" target="_blank" rel="noopener">Analysis Reports</a> · <a href="${esc(d.official_links.company_announcements)}" target="_blank" rel="noopener">Company Announcements</a></div>` : "";
+    el.innerHTML = (cards || `<div class="empty-chart">No filings were returned right now.</div>`) + fallbackLinks;
+  } catch (e) {
+    el.innerHTML = `<div class="error-panel">Could not load PSX filings: ${esc(e.message)}</div>`;
+  }
 }
 
 async function loadTechnicalVerdict(symbol) {
@@ -1511,15 +1528,22 @@ async function loadExtras() {
   }
 
   if ($("announcementList")) {
-    $("announcementList").innerHTML = d.announcements.map(item => `
-      <div class="announcement-card">
-        <div class="announcement-symbol">${esc(item.symbol)}</div>
-        <div>
-          <strong>${esc(item.title)}</strong>
-          <small>${esc(item.time)}</small>
-        </div>
-      </div>
-    `).join("");
+    try {
+      const live = await getJSON("/api/psx/financials?limit=60");
+      const rows = (live.announcements || []).map(item => `
+        <a class="announcement-card clickable-row" href="${esc(item.url)}" target="_blank" rel="noopener">
+          <div class="announcement-symbol">PSX</div>
+          <div><strong>${esc(item.title)}</strong><small>Official PSX filing</small></div>
+        </a>
+      `).join("");
+      $("announcementList").innerHTML = rows || d.announcements.map(item => `
+        <div class="announcement-card"><div class="announcement-symbol">${esc(item.symbol)}</div><div><strong>${esc(item.title)}</strong><small>${esc(item.time)}</small></div></div>
+      `).join("");
+    } catch (e) {
+      $("announcementList").innerHTML = d.announcements.map(item => `
+        <div class="announcement-card"><div class="announcement-symbol">${esc(item.symbol)}</div><div><strong>${esc(item.title)}</strong><small>${esc(item.time)}</small></div></div>
+      `).join("");
+    }
   }
 }
 
@@ -3806,7 +3830,12 @@ async function runPsxDivergenceScan() {
       }
       if (data.status === "done") {
         renderPsxDivergenceResult(data.result, resultsEl);
-        statusEl.textContent = `Scan complete — ${data.result.symbols_scanned} symbols checked, just now.`;
+        const total = Number(data.result?.symbols_scanned || 0);
+        const failed = Number(data.result?.symbols_failed || 0);
+        const usable = Number(data.result?.symbols_with_data ?? Math.max(0, total - failed));
+        statusEl.textContent = total
+          ? `Full PSX scan complete — ${total.toLocaleString()} symbols checked; ${usable.toLocaleString()} returned usable history${failed ? `; ${failed.toLocaleString()} failed.` : "."}`
+          : "Scan complete — no PSX symbols were returned.";
         return;
       }
       const p = data.progress;

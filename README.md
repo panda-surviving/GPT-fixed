@@ -39,7 +39,7 @@ monitors.
 
 This is PSX Toolkit's own original screen, kept as its own separate tab
 from PSX 360's filter-based Screener. It walks every PSX-listed stock's
-roughly one year of daily price history (via the free `psxdata` library)
+roughly one year of daily price history from the public PSX data portal, using a PSX-host fallback (`dps.csapis.com`) when the primary hostname is unreachable
 and reports, market-wide:
 - Stocks sitting near their 52-week low
 - Bullish RSI divergence (price makes a lower low, RSI makes a higher low)
@@ -88,8 +88,12 @@ A few real production issues were found and fixed:
 
 - **Shared, retry-hardened HTTP session** — every PSX/MUFAP request now goes through one connection-pooled `requests.Session()` with automatic retries on connection resets and 5xx/429 responses, instead of a fresh, unprotected connection per call. This was the direct cause of the `RemoteDisconnected`/"Connection aborted" errors under load.
 - **`/api/symbols` no longer blocks** — it used to make a live, synchronous PSX request on every cold start, so the first visitor after a Render free-tier wake-up could get stuck waiting (and failing) on it. It now serves cached (or a small built-in fallback) data instantly and always refreshes in the background, matching the pattern already used for live quotes.
-- **Divergence Screener runs 6 symbols concurrently** instead of one at a time — cuts a full ~700-symbol market scan from many minutes down to a fraction of that.
+- **Divergence Screener runs 6 symbols concurrently** instead of one at a time — allows the full market scan to progress concurrently while staying below the original request burst; the UI reports the exact number of symbols checked and any failures.
 - **Mutual Funds NaN/Infinity bug** — a malformed scraped number could silently become `NaN`/`Infinity`, which isn't valid JSON and crashes `response.json()` in the browser. Fixed at the source and backstopped everywhere with a blanket JSON-safety wrapper.
+
+### New: Financial Announcements & Reports
+
+The News page now loads live PSX company announcements when the public PSX data portal is reachable and links directly to official PSX financial-report and analysis-report repositories. Each stock detail page also has a Financial Announcements & Reports card that pulls that company's filing/document links. No filing titles or documents are fabricated when the source is unavailable.
 
 ### New: Consolidated Technical Verdict & Support/Resistance (stock page)
 
