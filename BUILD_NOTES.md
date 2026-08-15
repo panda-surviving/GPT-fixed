@@ -47,3 +47,16 @@ Health check:
 - `python tests/test_math.py` — PASS
 - `python tests/test_frontend_static.py` — PASS
 - Live outbound HTTPS from this sandbox to PSX is unavailable, so a live Render scan/browser session against PSX could not be honestly claimed as completed here. The code therefore uses the second PSX-hosted data portal as an explicit runtime fallback rather than pretending that the first host is always reachable.
+
+## v3 regression fix (2026-08-15)
+
+The supplied production screenshots exposed a concrete defect that was still present in v2: `/historical` was POSTed with only `symbol`. The current PSX historical page requires the month/year/symbol request parameters. The invalid request was surfacing in the browser as `The string did not match the expected pattern.`
+
+This build changes the historical provider chain to:
+1. Dedicated PSX scraper API cache (5-year daily OHLCV, if reachable).
+2. Yahoo Finance `.KA` daily OHLCV (one request returns the full daily series).
+3. Correct PSX Data Portal monthly `month/year/symbol` requests as the final fallback.
+
+The full divergence scan no longer uses the 10-symbol development fallback. It obtains the real universe from PSX or the dedicated PSX scraper API and fails explicitly if neither complete universe is available.
+
+The chart now reports its data source, uses real OHLCV, and the stock-detail technical verdict visibly renders the current RSI/MACD/SMA/EMA values as well as the classic and Fibonacci pivot tables. The monthly resampling rule was changed from `ME` to `M` for pandas compatibility.

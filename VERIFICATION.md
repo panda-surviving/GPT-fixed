@@ -93,3 +93,20 @@ For final deployment verification, the required live checks are:
 - Mathematical regression tests: PASS.
 - Static frontend wiring test: PASS.
 - The sandbox cannot make outbound HTTPS connections to PSX, so a real Render-hosted market-wide scan and browser interaction against the live PSX service could not be truthfully claimed here. The alternate PSX host was independently confirmed as a live PSX data-portal host during implementation.
+
+## Production screenshot regression — v3
+
+The August 15, 2026 screenshots were used as a regression target. The error text `The string did not match the expected pattern.` was traced to the historical-data request path. The previous implementation POSTed only `symbol` to `/historical`; current PSX historical requests require month/year/symbol parameters. The v3 provider chain removes that invalid request as the primary path and adds a multi-provider fallback.
+
+### Verified statically in this environment
+
+- Python syntax: PASS (`app.py`, `psx_screener.py`)
+- JavaScript syntax: PASS (`static/app.js`, `static/sw.js`)
+- Regression tests: PASS (provider request shape, full-universe guard, provider fallbacks, monthly resampling, visible indicator/pivot UI, service-worker cache bump)
+- Full-scan route: confirmed it calls `get_symbols_for_full_scan()` and cannot silently scan the 10-symbol development fallback.
+- Chart route: confirmed it uses the same real historical OHLCV provider chain as the verdict and returns candlesticks, volume, SMA/EMA, RSI, MACD and pivot points.
+- Technical values: confirmed the API already returns RSI, MACD, SMA20/50/200 and EMA20/50/200; v3 now renders these values visibly in the stock-detail page.
+
+### Live verification limitation
+
+This sandbox cannot establish outbound HTTPS connections to PSX or Yahoo Finance, so a live 700+ symbol scan against Render cannot be truthfully claimed from this environment. The build therefore does not label the scan as live-verified. After deployment, the first required check is `/api/psxdivergence/scan/start` followed by `/api/psxdivergence/scan/status/<job_id>` until `status=done`; the UI must report the complete universe count rather than 10.

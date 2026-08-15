@@ -1293,6 +1293,28 @@ async function loadTechnicalVerdict(symbol) {
       </div>
     `;
 
+    const iv = d.indicators || {};
+    const technicalValueRows = [
+      ["RSI (14)", iv.rsi14, "—"],
+      ["MACD", iv.macd, ""],
+      ["MACD Signal", iv.macd_signal, ""],
+      ["MACD Histogram", iv.macd_histogram, ""],
+      ["SMA 20", iv.sma20, ""],
+      ["SMA 50", iv.sma50, ""],
+      ["SMA 200", iv.sma200, ""],
+      ["EMA 20", iv.ema20, ""],
+      ["EMA 50", iv.ema50, ""],
+      ["EMA 200", iv.ema200, ""],
+    ];
+    const technicalValuesHtml = `
+      <div class="table-scroll technical-values-wrap">
+        <table class="verdict-breakdown-table">
+          <thead><tr><th>Technical Value</th><th>Current Value</th></tr></thead>
+          <tbody>${technicalValueRows.map(([label, value]) => `<tr><td>${label}</td><td>${value == null ? "—" : Number(value).toFixed(label === "RSI (14)" ? 1 : 2)}</td></tr>`).join("")}</tbody>
+        </table>
+      </div>`;
+    $("technicalVerdictBody").insertAdjacentHTML("beforeend", `<h4 class="technical-values-title">Current Indicator Values</h4>${technicalValuesHtml}`);
+
     const pp = d.pivot_points;
     const pivotRows = (levels) => `
       <table class="pivot-table">
@@ -3833,8 +3855,9 @@ async function runPsxDivergenceScan() {
         const total = Number(data.result?.symbols_scanned || 0);
         const failed = Number(data.result?.symbols_failed || 0);
         const usable = Number(data.result?.symbols_with_data ?? Math.max(0, total - failed));
+        const universe = Number(data.result?.universe_count || total);
         statusEl.textContent = total
-          ? `Full PSX scan complete — ${total.toLocaleString()} symbols checked; ${usable.toLocaleString()} returned usable history${failed ? `; ${failed.toLocaleString()} failed.` : "."}`
+          ? `Full PSX scan complete — ${total.toLocaleString()} of ${universe.toLocaleString()} PSX symbols checked; ${usable.toLocaleString()} returned usable history${failed ? `; ${failed.toLocaleString()} failed.` : "."}`
           : "Scan complete — no PSX symbols were returned.";
         return;
       }
@@ -3933,7 +3956,7 @@ async function loadStockChart(symbol, timeframe) {
       ["mainPriceChart", "volumeChart", "rsiChart", "macdChart"].forEach(id => { if ($(id)) $(id).innerHTML = ""; });
       return;
     }
-    statusEl.textContent = "";
+    statusEl.textContent = d.data_source ? `Real market data: ${d.data_source}` : "";
     lastChartData = d;
     // Render on the next paint so the stock-detail page has a real width
     // after navigation; Lightweight Charts otherwise initializes at 0px on

@@ -12,6 +12,7 @@ import csv
 import uuid
 import datetime as dt
 import math
+import os
 from bs4 import BeautifulSoup
 
 # numpy/pandas power the intraday RSI-divergence technical scanners
@@ -93,6 +94,8 @@ PSX_ALT_SYMBOLS_URL = f"{PSX_ALT_BASE}/symbols"
 PSX_ALT_COMPANY_URL = f"{PSX_ALT_BASE}/company/{{symbol}}"
 PSX_ALT_INTRADAY_URL = f"{PSX_ALT_BASE}/timeseries/int/{{symbol}}"
 PSX_ALT_ELIGIBLE_URL = f"{PSX_ALT_BASE}/eligible-scrips"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.KA"
+PSX_SCRAPER_API_BASE = os.environ.get("PSX_SCRAPER_API_BASE", "https://nifraa-psx-stock-intel.hf.space/api").rstrip("/")
 
 
 HEADERS = {
@@ -202,7 +205,6 @@ FRANKFURTER_URL = "https://api.frankfurter.dev/v1/latest"
 # default "twelvedata") as environment variables to enable; without a
 # key everything gracefully falls back to the MULTI_MARKET development
 # data already used elsewhere in this file.
-import os
 MARKET_DATA_API_KEY = os.environ.get("MARKET_DATA_API_KEY", "").strip()
 MARKET_DATA_PROVIDER = os.environ.get("MARKET_DATA_PROVIDER", "twelvedata").strip().lower()
 _live_index_cache = {}
@@ -4365,97 +4367,148 @@ PSX_HISTORY_COLUMN_MAP = {
 }
 
 
-def fetch_psx_history_direct(symbol, max_retries=3, retry_delays=(1, 2)):
-    """Fetches full OHLCV price history for a single PSX symbol directly
-    from PSX's own historical-data endpoint (the same one the psxdata
-    library targets), reusing this app's already-proven request headers
-    and retry pattern instead of a separate package's own session/rate
-    limiter. This avoids two independent scrapers hitting dps.psx.com.pk
-    concurrently with different client fingerprints, which is the most
-    likely reason the psxdata-based version of this scan was timing out
-    in production even though the rest of this app reaches PSX fine."""
-    last_exc = None
-    resp = None
-    request_headers = {
-        **HEADERS,
-        "Accept": "text/html, */*;q=0.01",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    }
-    # Try the normal PSX hostname and then the alternate PSX data-portal
-    # hostname. The latter is a PSX-hosted mirror of the same public data
-    # portal and is substantially more reliable for some Render regions.
-    urls = [PSX_HISTORICAL_URL, f"{PSX_ALT_BASE}/historical"]
-    for base_url in urls:
-        for attempt in range(max_retries):
-            try:
-                resp = _http_session.post(
-                    base_url, data={"symbol": symbol.upper()},
-                    headers=request_headers, timeout=12,
-                )
-                resp.raise_for_status()
-                break
-            except requests.RequestException as e:
-                last_exc = e
-                resp = None
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delays[min(attempt, len(retry_delays) - 1)])
-        if resp is not None:
-            break
-    if resp is None:
-        raise RuntimeError(f"PSX historical data unavailable for {symbol} after trying both PSX data hosts: {last_exc}") from last_exc
+def fetch_psx_scraper_history(symbol):
+    response = _http_session.get(
+        f"{PSX_SCRAPER_API_BASE}/stocks/{symbol.upper()}/history",
+        params={"period": "5y", "interval": "daily"},
+        headers={"Accept": "application/json", "User-Agent": HEADERS["User-Agent"]},
+        timeout=20,
+    )
+    response.raise_for_status()
+    body = response.json()
+    data = body.get("data", body) if isinstance(body, dict) else body
+    if isinstance(data, dict):
+        data = data.get("candles") or data.get("history") or data.get("rows") or []
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("PSX scraper returned no historical candles")
+    rows = []
+    for row in data:
+        if isinstance(row, dict):
+            rows.append({"date": row.get("date") or row.get("day") or row.get("time"),
+                         "open": row.get("open"), "high": row.get("high"),
+                         "low": row.get("low"), "close": row.get("close"),
+                         "volume": row.get("volume")})
+    df = pd.DataFrame(rows)
+    if df.empty or "date" not in df or "close" not in df:
+        raise RuntimeError("PSX scraper history has no usable OHLCV columns")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+    for c in ("open", "high", "low", "close", "volume"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    if len(df) < 5:
+        raise RuntimeError("PSX scraper history has too few candles")
+    return df
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+
+def fetch_yahoo_psx_history(symbol, period="max"):
+    symbol = symbol.upper().strip()
+    if not re.match(r"^[A-Z0-9&.\-]{1,30}$", symbol):
+        raise ValueError(f"Invalid PSX symbol: {symbol!r}")
+    response = _http_session.get(
+        YAHOO_CHART_URL.format(symbol=symbol),
+        params={"range": period, "interval": "1d", "events": "div,splits", "includeAdjustedClose": "true"},
+        headers={**HEADERS, "Accept": "application/json,text/plain,*/*"}, timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    chart = payload.get("chart") or {}
+    if chart.get("error"):
+        raise RuntimeError(str(chart["error"].get("description") or chart["error"]))
+    result = (chart.get("result") or [None])[0]
+    if not result:
+        raise RuntimeError("Yahoo returned no chart result")
+    ts = result.get("timestamp") or []
+    quote = ((result.get("indicators") or {}).get("quote") or [None])[0] or {}
+    if not ts or not quote:
+        raise RuntimeError("Yahoo returned no OHLCV history")
+    df = pd.DataFrame({"date": pd.to_datetime(ts, unit="s", utc=True).tz_convert(None),
+                       "open": quote.get("open", []), "high": quote.get("high", []),
+                       "low": quote.get("low", []), "close": quote.get("close", []),
+                       "volume": quote.get("volume", [])})
+    for c in ("open", "high", "low", "close", "volume"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    if len(df) < 5:
+        raise RuntimeError("Yahoo returned too few OHLCV candles")
+    return df
+
+
+def _parse_history_html(html):
+    soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table")
     if table is None:
         return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
-
     header_cells = table.find_all("th")
-    headers = [th.get_text(strip=True).upper() for th in header_cells]
+    headers = [th.get_text(" ", strip=True).upper() for th in header_cells]
     if not headers:
-        first_row = table.find("tr")
-        headers = [c.get_text(strip=True).upper() for c in first_row.find_all(["td", "th"])] if first_row else []
-
+        first = table.find("tr")
+        headers = [c.get_text(" ", strip=True).upper() for c in first.find_all(["td", "th"])] if first else []
     col_index = {}
     for i, h in enumerate(headers):
         key = PSX_HISTORY_COLUMN_MAP.get(h)
         if key and key not in col_index:
             col_index[key] = i
-
     if "date" not in col_index or "close" not in col_index:
         return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+    rows=[]
+    for tr in table.find_all("tr"):
+        cells=tr.find_all("td")
+        if len(cells) <= max(col_index.values()): continue
+        texts=[c.get_text(" ", strip=True) for c in cells]
+        close=_number(texts[col_index["close"]])
+        if not texts[col_index["date"]] or close is None: continue
+        rows.append({"date":texts[col_index["date"]], "open":_number(texts[col_index["open"]]) if "open" in col_index else None,
+                     "high":_number(texts[col_index["high"]]) if "high" in col_index else None, "low":_number(texts[col_index["low"]]) if "low" in col_index else None,
+                     "close":close, "volume":_number(texts[col_index["volume"]]) if "volume" in col_index else None})
+    if not rows: return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+    df=pd.DataFrame(rows)
+    raw=df["date"].astype(str).str.strip()
+    parsed=pd.to_datetime(raw, format="%d-%m-%Y", errors="coerce")
+    mask=parsed.isna()
+    if mask.any(): parsed.loc[mask]=pd.to_datetime(raw[mask], format="%Y-%m-%d", errors="coerce")
+    mask=parsed.isna()
+    if mask.any(): parsed.loc[mask]=pd.to_datetime(raw[mask], errors="coerce", dayfirst=True)
+    df["date"]=parsed
+    for c in ("open","high","low","close","volume"): df[c]=pd.to_numeric(df[c], errors="coerce")
+    return df.dropna(subset=["date","close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
 
-    body_rows = table.find_all("tr")
-    if header_cells:
-        body_rows = [r for r in body_rows if not r.find_all("th")]
-    else:
-        body_rows = body_rows[1:]  # first row was the header row (all <td>)
 
-    rows = []
-    for tr in body_rows:
-        cells = tr.find_all("td")
-        if len(cells) <= max(col_index.values()):
-            continue
-        texts = [c.get_text(strip=True) for c in cells]
-        close_val = _number(texts[col_index["close"]])
-        if not texts[col_index["date"]] or close_val is None:
-            continue
-        rows.append({
-            "date": texts[col_index["date"]],
-            "open": _number(texts[col_index["open"]]) if "open" in col_index else None,
-            "high": _number(texts[col_index["high"]]) if "high" in col_index else None,
-            "low": _number(texts[col_index["low"]]) if "low" in col_index else None,
-            "close": close_val,
-            "volume": _number(texts[col_index["volume"]]) if "volume" in col_index else None,
-        })
+def fetch_psx_history_direct(symbol, max_retries=2, retry_delays=(1, 2)):
+    """Real PSX-listed daily OHLCV provider chain.
 
-    if not rows:
-        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+    The old code POSTed only ``symbol`` to /historical. The current PSX portal
+    expects month/year/symbol; that invalid request is what caused the
+    production ``The string did not match the expected pattern`` error.
+    """
+    symbol=symbol.upper().strip()
+    errors=[]
+    for label, fn in (("PSX scraper API", lambda: fetch_psx_scraper_history(symbol)),
+                      ("Yahoo .KA", lambda: fetch_yahoo_psx_history(symbol, "max"))):
+        try:
+            df=fn()
+            if df is not None and len(df)>=5: return df
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
 
-    df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
-    return df
-
+    # Correct PSX fallback: one month per request, with the parameters the
+    # historical endpoint actually requires. This path is intentionally last
+    # because Yahoo/PSX-scraper return multi-year history in one call.
+    today=date.today(); y,m=today.year,today.month; pieces=[]
+    for _ in range(15):
+        for base_url in (PSX_HISTORICAL_URL, f"{PSX_ALT_BASE}/historical"):
+            try:
+                resp=_http_session.post(base_url, data={"month":m,"year":y,"symbol":symbol}, headers={**HEADERS,"Accept":"text/html, */*;q=0.01","Content-Type":"application/x-www-form-urlencoded; charset=UTF-8"}, timeout=12)
+                resp.raise_for_status(); part=_parse_history_html(resp.text)
+                if not part.empty: pieces.append(part)
+                break
+            except Exception as exc:
+                errors.append(f"PSX {y}-{m:02d}: {exc}")
+        m-=1
+        if m==0: y-=1; m=12
+    if pieces:
+        df=pd.concat(pieces, ignore_index=True).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+        if len(df)>=5: return df
+    raise RuntimeError(f"No real historical OHLCV available for {symbol}. Providers tried: {' | '.join(errors[-4:])}")
 
 def compute_multi_timeframe_divergence(full_df, daily_df):
     """Independently checks for RSI divergence on daily, weekly and
@@ -4469,7 +4522,7 @@ def compute_multi_timeframe_divergence(full_df, daily_df):
     tf_specs = [
         ("div_1d", daily_df, None, PSX_DIVERGENCE_LOOKBACK_DAYS, PSX_DIVERGENCE_SWING_ORDER, PSX_DIVERGENCE_MIN_TRADING_DAYS),
         ("div_1w", full_df, "W", 26, 3, 20),
-        ("div_1m", full_df, "ME", 15, 2, 12),
+        ("div_1m", full_df, "M", 15, 2, 12),
     ]
 
     for key, src_df, rule, lookback, swing_order, min_bars in tf_specs:
@@ -4563,8 +4616,8 @@ def _analyze_one_psx_divergence_symbol(symbol, start_date):
 # PSX throttles repeated historical POSTs fairly aggressively. Four workers
 # keeps the scan materially faster than serial requests without creating the
 # burst of simultaneous connections that caused the original timeout failures.
-PSX_DIVERGENCE_SCAN_WORKERS = 6
-PSX_DIVERGENCE_HISTORY_CACHE_HOURS = 6
+PSX_DIVERGENCE_SCAN_WORKERS = 8
+PSX_DIVERGENCE_HISTORY_CACHE_HOURS = 24
 _psx_divergence_history_cache = {}
 _psx_divergence_history_cache_lock = threading.Lock()
 
@@ -4580,6 +4633,43 @@ def get_divergence_history_cached(symbol):
         with _psx_divergence_history_cache_lock:
             _psx_divergence_history_cache[symbol] = {"df": df, "time": now}
     return df
+
+
+
+def fetch_psx_scraper_universe():
+    rows=[]; page=1; size=1000
+    while page<=5:
+        r=_http_session.get(f"{PSX_SCRAPER_API_BASE}/stocks", params={"page":page,"size":size}, headers={"Accept":"application/json","User-Agent":HEADERS["User-Agent"]}, timeout=20)
+        r.raise_for_status(); body=r.json(); data=body.get("data",body) if isinstance(body,dict) else body
+        if isinstance(data,dict): data=data.get("stocks") or data.get("items") or data.get("rows") or []
+        if not isinstance(data,list): raise RuntimeError("Unexpected PSX scraper universe response")
+        rows.extend(data)
+        if len(data)<size: break
+        page+=1
+    out=[]; seen=set()
+    for row in rows:
+        if not isinstance(row,dict): continue
+        symbol=str(row.get("symbol") or row.get("ticker") or "").strip().upper()
+        if not symbol or symbol in seen: continue
+        typ=str(row.get("instrument_type") or row.get("asset_class") or "").lower()
+        if any(x in typ for x in ("debt","bond","sukuk","etf")): continue
+        seen.add(symbol); out.append({"symbol":symbol,"company":str(row.get("name") or row.get("company") or row.get("company_name") or symbol),"sector":str(row.get("sector") or row.get("sector_name") or "")})
+    out.sort(key=lambda x:x["symbol"])
+    if len(out)<100: raise RuntimeError(f"PSX scraper returned only {len(out)} symbols")
+    return out
+
+
+def get_symbols_for_full_scan():
+    try:
+        items=fetch_psx_symbols(force=True)
+        if len(items)>=100: return items
+    except Exception: pass
+    try:
+        items=fetch_psx_scraper_universe()
+        with _symbol_lock: _symbol_cache.update({"items":items,"time":datetime.now()})
+        return items
+    except Exception as exc:
+        raise RuntimeError("Unable to obtain a complete PSX universe; scan was NOT run on the 10-symbol development fallback.") from exc
 
 
 def run_psx_divergence_scan(progress_cb=None):
@@ -4599,21 +4689,10 @@ def run_psx_divergence_scan(progress_cb=None):
     15-30+ minutes strictly sequentially now takes a fraction of that."""
     import concurrent.futures
 
-    tickers, warmed = get_symbols_nonblocking()
-    if not warmed:
-        # The route itself remains instant; the background scan can wait briefly
-        # for the real directory rather than scanning only the ten fallback names.
-        deadline = time.time() + 90
-        while time.time() < deadline:
-            try:
-                tickers = fetch_psx_symbols()
-                if tickers:
-                    break
-            except Exception:
-                time.sleep(2)
-        if not tickers:
-            raise RuntimeError("PSX symbol directory is unavailable after the cold-start grace period.") 
-    tickers = [s["symbol"] for s in tickers]
+    # A full scan is intentionally different from the normal directory route:
+    # it must never fall back to the 10 development symbols.
+    tickers_meta = get_symbols_for_full_scan()
+    tickers = [s["symbol"] for s in tickers_meta]
     if not tickers:
         raise RuntimeError("PSX did not return a symbol list.")
 
@@ -4684,6 +4763,7 @@ def run_psx_divergence_scan(progress_cb=None):
         "downtrend_divergence": sort_hits(downtrend_hits, "symbol"),
         "errors": errors,
         "symbols_scanned": total,
+        "universe_count": total,
         "symbols_with_data": total - len(errors),
         "symbols_failed": len(errors),
         "scan_complete": True,
@@ -5006,7 +5086,7 @@ CHART_TIMEFRAME_CONFIG = {
     "1Y": {"days": 370, "resample": None},
     "3Y": {"days": 370 * 3, "resample": "W"},
     "5Y": {"days": 370 * 5, "resample": "W"},
-    "ALL": {"days": None, "resample": "ME"},
+    "ALL": {"days": None, "resample": "M"},
 }
 CHART_MIN_CANDLES = 5
 
